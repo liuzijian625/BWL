@@ -13,6 +13,7 @@ from torch.utils.data import TensorDataset, DataLoader
 
 import models.architectures as arch
 from utils.data_loader import load_bcw, load_cifar10, load_cinic10, create_dataloader
+from losses.boundary_wandering_loss import boundary_wandering_loss
 
 # --- 日志记录类 ---
 class Logger(object):
@@ -40,17 +41,16 @@ DATA_LOADER_MAP = {
     "cinic10": load_cinic10
 }
 
-# ============================== Direct LIA Training and Attack ==============================
-def train_and_attack(args, X_a_train, X_b_train, y_train):
+# ============================== Direct LIA Training with BWL Defense ==============================
+def train_and_attack_with_defense(args, X_a_train, X_b_train, y_train):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"--- 开始在 {args.dataset} 上进行直接LIA攻击训练 ---")
+    print(f"--- 开始在 {args.dataset} 上进行带BWL防御的直接LIA场景训练 ---")
     
     with open('config.json', 'r') as f:
         config = json.load(f)[args.dataset]
     params = config['params']
     model_config = config['vanilla']
 
-    # 创建一个包含原始索引的数据集
     train_indices = torch.arange(len(y_train))
     train_dataset = TensorDataset(X_a_train, X_b_train, y_train, train_indices)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
@@ -70,7 +70,7 @@ def train_and_attack(args, X_a_train, X_b_train, y_train):
 
     inferred_labels = torch.full((len(y_train),), -1, dtype=torch.long)
 
-    print(f"--- 开始VFL训练并同步进行梯度分析 ---")
+    print(f"--- 开始VFL训练并同步进行梯度分析 (BWL防御已激活) ---")
     for epoch in range(args.epochs):
         for i, (batch_X_a, batch_X_b, batch_y, batch_indices) in enumerate(train_loader):
             batch_X_a, batch_X_b, batch_y = batch_X_a.to(device), batch_X_b.to(device), batch_y.to(device)
@@ -84,9 +84,13 @@ def train_and_attack(args, X_a_train, X_b_train, y_train):
             def hook(grad): grad_a[0] = grad
             logits_a.register_hook(hook)
 
-            total_logits = logits_a + logits_b
-            loss = criterion(total_logits, batch_y)
-            loss.backward()
+            # 新的总损失函数
+            pred_loss = criterion(logits_a + logits_b, batch_y)
+            attacker_bw_loss = args.alpha * boundary_wandering_loss(logits_a, batch_y)
+            defender_bw_loss = args.beta * boundary_wandering_loss(logits_b, batch_y)
+            total_loss = pred_loss + attacker_bw_loss + defender_bw_loss
+
+            total_loss.backward()
             for opt in optimizers: opt.step()
 
             if grad_a[0] is not None:
@@ -101,13 +105,13 @@ def train_and_attack(args, X_a_train, X_b_train, y_train):
     total_inferred = valid_inferences.sum().item()
     attack_accuracy = 100 * correct_total / total_inferred if total_inferred > 0 else 0
     
-    print(f'Direct LIA Attack Accuracy on {args.dataset} train set: {attack_accuracy:.2f} %')
+    print(f'Direct LIA (在BWL防御下) 在 {args.dataset} 训练集上的准确率: {attack_accuracy:.2f} %')
     return (party_a_model, party_b_model), attack_accuracy
 
 # ============================== Main Task Performance Evaluation ==============================
-def test_direct_vfl(args, models, X_a_test, X_b_test, y_test):
+def test_vfl(args, models, X_a_test, X_b_test, y_test):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print("--- 评估直接攻击场景下的VFL主任务性能 ---")
+    print("--- 评估防御后的VFL主任务性能 ---")
     party_a_model, party_b_model = models
     party_a_model.eval()
     party_b_model.eval()
@@ -134,7 +138,7 @@ def save_results(args, main_accuracy, attack_accuracy):
     results_file = os.path.join('result', 'results.csv')
     fieldnames = ['algorithm', 'dataset', 'main_accuracy', 'shadow_accuracy', 'attack_accuracy']
     new_record = {
-        'algorithm': 'Direct_LIA',
+        'algorithm': 'Direct_LIA_w_BWL_Defense',
         'dataset': args.dataset,
         'main_accuracy': f'{main_accuracy:.2f}',
         'shadow_accuracy': 'N/A',
@@ -148,7 +152,7 @@ def save_results(args, main_accuracy, attack_accuracy):
             writer.writerow(new_record)
     else:
         df = pd.read_csv(results_file)
-        existing_index = df[(df['algorithm'] == 'Direct_LIA') & (df['dataset'] == args.dataset)].index
+        existing_index = df[(df['algorithm'] == new_record['algorithm']) & (df['dataset'] == args.dataset)].index
         if not existing_index.empty:
             df.loc[existing_index, list(new_record.keys())] = list(new_record.values())
         else:
@@ -160,28 +164,30 @@ def save_results(args, main_accuracy, attack_accuracy):
 
 # ============================== Main Execution ==============================
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Direct Label Inference Attack on a simplified VFL.")
+    parser = argparse.ArgumentParser(description="Direct LIA with BWL-style Defense.")
     parser.add_argument('--dataset', type=str, required=True, choices=['bcw', 'cifar10', 'cinic10'], help='Dataset for the attack.')
-    parser.add_argument('--epochs', type=int, default=1, help='Number of training epochs (1 is often enough for this attack).')
+    parser.add_argument('--epochs', type=int, default=10, help='Number of training epochs.')
     parser.add_argument('--lr', type=float, default=0.001, help='Learning rate.')
     parser.add_argument('--batch_size', type=int, default=64, help='Batch size.')
+    parser.add_argument('--alpha', type=float, default=0.5, help='Weight for the BWL term on the attacker.')
+    parser.add_argument('--beta', type=float, default=0.5, help='Weight for the BWL term on the defender.')
     
     args = parser.parse_args()
 
     log_dir = 'result'
     os.makedirs(log_dir, exist_ok=True)
-    log_file_path = os.path.join(log_dir, f'direct_lia_{args.dataset}_results.txt')
+    log_file_path = os.path.join(log_dir, f'direct_lia_w_bwl_defense_{args.dataset}_results.txt')
     sys.stdout = Logger(log_file_path, sys.stdout)
 
-    print(f"========== 开始在 {args.dataset} 上进行直接LIA攻击 ==========")
+    print(f"========== 开始在 {args.dataset} 上进行 Direct LIA w/ BWL Defense ==========")
 
     data_loader = DATA_LOADER_MAP[args.dataset]
     (X_a_train, X_b_train, y_train), (X_a_test, X_b_test, y_test) = data_loader()
 
-    vfl_models, attack_accuracy = train_and_attack(args, X_a_train, X_b_train, y_train)
+    vfl_models, attack_accuracy = train_and_attack_with_defense(args, X_a_train, X_b_train, y_train)
 
-    main_accuracy = test_direct_vfl(args, vfl_models, X_a_test, X_b_test, y_test)
+    main_accuracy = test_vfl(args, vfl_models, X_a_test, X_b_test, y_test)
 
     save_results(args, main_accuracy, attack_accuracy)
 
-    print(f"========== 直接LIA攻击流程结束 ==========")
+    print(f"========== Direct LIA w/ BWL Defense 流程结束 ==========")

@@ -88,7 +88,6 @@ def train_vfl(args, X_a_vfl, X_b_vfl, y_vfl):
         print(f'VFL训练周期 [{epoch+1}/{args.epochs}] 完成, 损失: {loss.item():.4f}')
 
     print("--- VFL训练结束 ---")
-    # 返回所有模型用于主任务评估，并将A的模型移到CPU给攻击者
     return party_a_model.to('cpu'), party_b_model, top_model
 
 # ============================== Main Task Performance Evaluation ==============================
@@ -97,7 +96,6 @@ def test_vfl(args, vfl_models, X_a_test, X_b_test, y_test):
     print("--- 评估VFL主任务性能 ---")
     party_a_model, party_b_model, top_model = vfl_models
     
-    # 将模型A复制到评估设备
     party_a_model = party_a_model.to(device)
     party_a_model.eval()
     party_b_model.eval()
@@ -117,9 +115,9 @@ def test_vfl(args, vfl_models, X_a_test, X_b_test, y_test):
             total += batch_y.size(0)
             correct += (predicted == batch_y).sum().item()
 
-    main_task_accuracy = 100 * correct / total
-    print(f'VFL主任务在 {args.dataset} 测试集上的准确率: {main_task_accuracy:.2f} %')
-    return main_task_accuracy
+    main_accuracy = 100 * correct / total if total > 0 else 0
+    print(f'VFL Main Accuracy on {args.dataset} test set: {main_accuracy:.2f} %')
+    return main_accuracy
 
 # ============================== Phase 2 & 3: Attack Model Training ==============================
 class AttackModel(nn.Module):
@@ -141,11 +139,10 @@ def train_attack_model(args, party_a_model, X_a_aux, y_aux):
         config = json.load(f)[args.dataset]
     params = config['params']
     
-    # Note: create_dataloader expects X_b, so we pass a dummy tensor
     aux_loader = create_dataloader(X_a_aux, torch.zeros(len(X_a_aux), 0), y_aux, batch_size=args.batch_size)
 
     attack_model = AttackModel(
-        feature_extractor=party_a_model.to(device), # Move party_a_model to device for training
+        feature_extractor=party_a_model.to(device),
         num_classes=params['num_classes'],
         embedding_dim=params['embedding_dim']
     ).to(device)
@@ -156,13 +153,11 @@ def train_attack_model(args, party_a_model, X_a_aux, y_aux):
     for epoch in range(args.attack_epochs):
         for batch_X_a, _, batch_y in aux_loader:
             batch_X_a, batch_y = batch_X_a.to(device), batch_y.to(device)
-            
             optimizer.zero_grad()
             prediction = attack_model(batch_X_a)
             loss = criterion(prediction, batch_y)
             loss.backward()
             optimizer.step()
-        
         print(f'攻击模型训练周期 [{epoch+1}/{args.attack_epochs}] 完成, 损失: {loss.item():.4f}')
     
     print("--- 攻击模型训练结束 ---")
@@ -182,48 +177,43 @@ def perform_inference(args, attack_model, X_a_test, y_test):
     with torch.no_grad():
         for batch_X_a, _, batch_y in test_loader:
             batch_X_a, batch_y = batch_X_a.to(device), batch_y.to(device)
-            
             prediction = attack_model(batch_X_a)
             _, predicted = torch.max(prediction.data, 1)
             total += batch_y.size(0)
             correct += (predicted == batch_y).sum().item()
 
-    attack_accuracy = 100 * correct / total
-    print(f'被动标签推断攻击在 {args.dataset} 测试集上的准确率: {attack_accuracy:.2f} %')
+    attack_accuracy = 100 * correct / total if total > 0 else 0
+    print(f'Passive LIA Attack Accuracy on {args.dataset} test set: {attack_accuracy:.2f} %')
     return attack_accuracy
 
 # ============================== Save Results ==============================
-def save_results(args, main_task_accuracy, attack_accuracy):
+def save_results(args, main_accuracy, attack_accuracy):
     results_file = os.path.join('result', 'results.csv')
-    
-    should_write_header = not os.path.isfile(results_file)
-    
-    # 检查重复
-    if not should_write_header:
-        try:
-            existing_df = pd.read_csv(results_file)
-            record_exists = ((existing_df['algorithm'] == 'Passive_LIA') &
-                           (existing_df['dataset'] == args.dataset) &
-                           (existing_df['main_task_accuracy'] == f'{main_task_accuracy:.2f}') &
-                           (existing_df['attack_accuracy'] == f'{attack_accuracy:.2f}')).any()
-            if record_exists:
-                print("结果已存在于CSV文件中，跳过重复记录。")
-                return
-        except (pd.errors.EmptyDataError, FileNotFoundError):
-            pass # 文件为空或不存在，继续写入
+    fieldnames = ['algorithm', 'dataset', 'main_accuracy', 'shadow_accuracy', 'attack_accuracy']
+    new_record = {
+        'algorithm': 'Passive_LIA',
+        'dataset': args.dataset,
+        'main_accuracy': f'{main_accuracy:.2f}',
+        'shadow_accuracy': 'N/A',
+        'attack_accuracy': f'{attack_accuracy:.2f}'
+    }
 
-    with open(results_file, 'a', newline='', encoding='utf-8') as csvfile:
-        fieldnames = ['algorithm', 'dataset', 'main_task_accuracy', 'attack_accuracy']
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        if should_write_header:
+    if not os.path.isfile(results_file):
+        with open(results_file, 'w', newline='') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
-        writer.writerow({
-            'algorithm': 'Passive_LIA',
-            'dataset': args.dataset,
-            'main_task_accuracy': f'{main_task_accuracy:.2f}',
-            'attack_accuracy': f'{attack_accuracy:.2f}'
-        })
-    print(f"结果已保存到 {results_file}")
+            writer.writerow(new_record)
+    else:
+        df = pd.read_csv(results_file)
+        existing_index = df[(df['algorithm'] == 'Passive_LIA') & (df['dataset'] == args.dataset)].index
+        if not existing_index.empty:
+            df.loc[existing_index, list(new_record.keys())] = list(new_record.values())
+        else:
+            new_df = pd.DataFrame([new_record])
+            df = pd.concat([df, new_df], ignore_index=True)
+        df.to_csv(results_file, index=False)
+        
+    print(f"结果已更新/保存到 {results_file}")
 
 # ============================== Main Execution ==============================
 if __name__ == '__main__':
@@ -237,7 +227,6 @@ if __name__ == '__main__':
     
     args = parser.parse_args()
 
-    # 设置日志
     log_dir = 'result'
     os.makedirs(log_dir, exist_ok=True)
     log_file_path = os.path.join(log_dir, f'passive_lia_{args.dataset}_results.txt')
@@ -245,11 +234,9 @@ if __name__ == '__main__':
 
     print(f"========== 开始在 {args.dataset} 上进行被动LIA攻击 ==========")
     
-    # 1. 加载完整数据
     data_loader = DATA_LOADER_MAP[args.dataset]
     (X_a_train_full, X_b_train_full, y_train_full), (X_a_test, X_b_test, y_test) = data_loader()
 
-    # 2. 切分VFL训练数据和攻击者的辅助数据
     indices = np.arange(len(X_a_train_full))
     train_indices, aux_indices = train_test_split(indices, test_size=args.aux_data_ratio, random_state=42)
     
@@ -259,19 +246,14 @@ if __name__ == '__main__':
 
     print(f"数据切分完成: VFL训练数据 {len(y_vfl)} 条, 攻击者辅助数据 {len(y_aux)} 条。")
 
-    # 3. Phase 1: 训练VFL
     party_a_model_cpu, party_b_model, top_model = train_vfl(args, X_a_vfl, X_b_vfl, y_vfl)
 
-    # 4. 评估主任务性能
-    main_task_accuracy = test_vfl(args, (party_a_model_cpu.clone(), party_b_model, top_model), X_a_test, X_b_test, y_test)
+    main_accuracy = test_vfl(args, (party_a_model_cpu, party_b_model, top_model), X_a_test, X_b_test, y_test)
 
-    # 5. Phase 2 & 3: 训练攻击模型
     attack_model = train_attack_model(args, party_a_model_cpu, X_a_aux, y_aux)
 
-    # 6. Phase 4: 执行推断并报告攻击性能
     attack_accuracy = perform_inference(args, attack_model, X_a_test, y_test)
 
-    # 7. 保存结果
-    save_results(args, main_task_accuracy, attack_accuracy)
+    save_results(args, main_accuracy, attack_accuracy)
 
     print(f"========== 被动LIA攻击流程结束 ==========")

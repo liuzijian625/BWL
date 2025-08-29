@@ -9,6 +9,7 @@ import sys
 import os
 import csv
 import pandas as pd
+from sklearn.model_selection import train_test_split
 
 import models.architectures as arch
 from losses.boundary_wandering_loss import boundary_wandering_loss
@@ -28,7 +29,7 @@ class Logger(object):
     def flush(self):
         pass
 
-# --- 模型与数据加载器的映射 ---
+# --- 模型与数据加载器的映射 (从main.py复制) ---
 MODEL_MAP = {
     "FCNN_Bottom": arch.FCNN_Bottom,
     "FCNN_Shadow": arch.FCNN_Shadow,
@@ -49,18 +50,17 @@ DATA_LOADER_MAP = {
     "cinic10": load_cinic10
 }
 
-# --- 训练函数 ---
-def train(args):
+# ============================== Phase 1: BWL VFL Training ==============================
+# (从main.py复制并适应) 
+def train_bwl(args, X_a_train, X_b_train, y_train):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"使用设备: {device}")
+    print(f"--- Phase 1: 在VFL数据上进行BWL训练 ---")
     
     with open('config.json', 'r') as f:
         config = json.load(f)[args.dataset]
     params = config['params']
     model_config = config['bwl']
 
-    data_loader = DATA_LOADER_MAP[args.dataset]
-    (X_a_train, X_b_train, y_train), (X_a_test, X_b_test, y_test) = data_loader()
     train_loader = create_dataloader(X_a_train, X_b_train, y_train, batch_size=args.batch_size)
 
     if config['model_type'] == 'fcnn':
@@ -90,23 +90,16 @@ def train(args):
     shadow_top_model = MODEL_MAP[model_config['shadow_top_model']](input_dim=embedding_dim * 2, output_dim=num_classes)
     main_top_model = MODEL_MAP[model_config['main_top_model']](input_dim=embedding_dim * 3, output_dim=num_classes)
     
-    party_a_model, public_model, private_model, shadow_top_model, main_top_model =party_a_model.to(device), public_model.to(device), private_model.to(device), shadow_top_model.to(device), main_top_model.to(device)
+    models_on_device = [m.to(device) for m in [party_a_model, public_model, private_model, shadow_top_model, main_top_model]]
+    party_a_model, public_model, private_model, shadow_top_model, main_top_model = models_on_device
 
-    optimizers = [
-        optim.Adam(party_a_model.parameters(), lr=args.lr),
-        optim.Adam(public_model.parameters(), lr=args.lr),
-        optim.Adam(private_model.parameters(), lr=args.lr),
-        optim.Adam(shadow_top_model.parameters(), lr=args.lr),
-        optim.Adam(main_top_model.parameters(), lr=args.lr)
-    ]
+    optimizers = [optim.Adam(m.parameters(), lr=args.lr) for m in models_on_device]
     criterion = nn.CrossEntropyLoss()
 
     print(f"--- 开始在 {args.dataset} 数据集上进行BWL训练 (共 {args.epochs} 个周期) ---")
-    
     for epoch in range(args.epochs):
         for i, (batch_X_a, batch_X_b, batch_y) in enumerate(train_loader):
             batch_X_a, batch_X_b, batch_y = batch_X_a.to(device), batch_X_b.to(device), batch_y.to(device)
-            
             for opt in optimizers: opt.zero_grad()
 
             if config['model_type'] == 'fcnn':
@@ -137,20 +130,16 @@ def train(args):
             main_loss.backward()
             optimizers[2].step()
             optimizers[4].step()
-            
-        print(f'=== 周期 [{epoch+1}/{args.epochs}] 完成 ===')
+        print(f'=== BWL训练周期 [{epoch+1}/{args.epochs}] 完成 ===')
 
-    print("--- 训练结束 ---")
-    
-    models = (party_a_model, public_model, private_model, shadow_top_model, main_top_model)
-    test_data = (X_a_test, X_b_test, y_test)
-    split_indices = (public_indices, private_indices)
-    return models, test_data, split_indices, config
+    print("--- BWL训练结束 ---")
+    return models_on_device, (public_indices, private_indices), config
 
-# --- 测试函数 ---
-def test(args, models, test_data, split_indices, config):
+# ============================== BWL Performance Evaluation ==============================
+# (从main.py复制并适应)
+def test_bwl(args, models, test_data, split_indices, config):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print("--- 开始测试 ---")
+    print("--- 评估BWL模型性能 ---")
     party_a_model, public_model, private_model, shadow_top_model, main_top_model = models
     X_a_test, X_b_test, y_test = test_data
     public_indices, private_indices = split_indices
@@ -163,7 +152,6 @@ def test(args, models, test_data, split_indices, config):
     with torch.no_grad():
         for batch_X_a, batch_X_b, batch_y in test_loader:
             batch_X_a, batch_X_b, batch_y = batch_X_a.to(device), batch_X_b.to(device), batch_y.to(device)
-            
             if config['model_type'] == 'fcnn':
                 batch_X_b_public, batch_X_b_private = batch_X_b[:, public_indices], batch_X_b[:, private_indices]
             else:
@@ -185,22 +173,79 @@ def test(args, models, test_data, split_indices, config):
             correct_shadow += (predicted_shadow == batch_y).sum().item()
             correct_main += (predicted_main == batch_y).sum().item()
 
-    shadow_acc_val = 100 * correct_shadow / total if total > 0 else 0
-    main_acc_val = 100 * correct_main / total if total > 0 else 0
-    print(f'BWL 影子准确率 (Shadow Accuracy) 在 {args.dataset} 测试集上: {shadow_acc_val:.2f} %')
-    print(f'BWL 真实准确率 (Main Accuracy) 在 {args.dataset} 测试集上: {main_acc_val:.2f} %')
+    shadow_acc = 100 * correct_shadow / total if total > 0 else 0
+    main_acc = 100 * correct_main / total if total > 0 else 0
+    print(f'BWL 影子准确率 (Shadow Accuracy) 在 {args.dataset} 测试集上: {shadow_acc:.2f} %')
+    print(f'BWL 真实准确率 (Main Accuracy) 在 {args.dataset} 测试集上: {main_acc:.2f} %')
+    return main_acc, shadow_acc
 
-    # 保存或更新结果
+# ============================== Attack Logic (from passive_lia.py) ==============================
+class AttackModel(nn.Module):
+    def __init__(self, feature_extractor, num_classes, embedding_dim):
+        super(AttackModel, self).__init__()
+        self.feature_extractor = feature_extractor
+        for param in self.feature_extractor.parameters():
+            param.requires_grad = False
+        self.classifier_head = nn.Linear(embedding_dim, num_classes)
+
+    def forward(self, x):
+        return self.classifier_head(self.feature_extractor(x))
+
+def train_attack_model(args, party_a_model, X_a_aux, y_aux):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"--- Phase 2: 在辅助数据上训练攻击模型 ---")
+    with open('config.json', 'r') as f:
+        config = json.load(f)[args.dataset]
+    params = config['params']
+    aux_loader = create_dataloader(X_a_aux, torch.zeros(len(X_a_aux), 0), y_aux, batch_size=args.batch_size)
+    attack_model = AttackModel(
+        feature_extractor=party_a_model.to(device),
+        num_classes=params['num_classes'],
+        embedding_dim=params['embedding_dim']
+    ).to(device)
+    optimizer = optim.Adam(attack_model.classifier_head.parameters(), lr=args.lr)
+    criterion = nn.CrossEntropyLoss()
+    for epoch in range(args.attack_epochs):
+        for batch_X_a, _, batch_y in aux_loader:
+            batch_X_a, batch_y = batch_X_a.to(device), batch_y.to(device)
+            optimizer.zero_grad()
+            prediction = attack_model(batch_X_a)
+            loss = criterion(prediction, batch_y)
+            loss.backward()
+            optimizer.step()
+        print(f'攻击模型训练周期 [{epoch+1}/{args.attack_epochs}] 完成, 损失: {loss.item():.4f}')
+    print("--- 攻击模型训练结束 ---")
+    return attack_model.to('cpu')
+
+def perform_inference(args, attack_model, X_a_test, y_test):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"--- Phase 3: 在测试集上进行标签推断 ---")
+    attack_model = attack_model.to(device)
+    attack_model.eval()
+    test_loader = create_dataloader(X_a_test, torch.zeros(len(X_a_test), 0), y_test, batch_size=args.batch_size, shuffle=False)
+    correct, total = 0, 0
+    with torch.no_grad():
+        for batch_X_a, _, batch_y in test_loader:
+            batch_X_a, batch_y = batch_X_a.to(device), batch_y.to(device)
+            prediction = attack_model(batch_X_a)
+            _, predicted = torch.max(prediction.data, 1)
+            total += batch_y.size(0)
+            correct += (predicted == batch_y).sum().item()
+    attack_accuracy = 100 * correct / total if total > 0 else 0
+    print(f'被动攻击在BWL防御下的准确率: {attack_accuracy:.2f} %')
+    return attack_accuracy
+
+# ============================== Save Results ==============================
+def save_results(args, main_accuracy, shadow_accuracy, attack_accuracy):
     results_file = os.path.join('result', 'results.csv')
     fieldnames = ['algorithm', 'dataset', 'main_accuracy', 'shadow_accuracy', 'attack_accuracy']
     new_record = {
-        'algorithm': 'BWL',
+        'algorithm': 'Passive_LIA_on_BWL',
         'dataset': args.dataset,
-        'main_accuracy': f'{main_acc_val:.2f}',
-        'shadow_accuracy': f'{shadow_acc_val:.2f}',
-        'attack_accuracy': 'N/A'
+        'main_accuracy': f'{main_accuracy:.2f}',
+        'shadow_accuracy': f'{shadow_accuracy:.2f}',
+        'attack_accuracy': f'{attack_accuracy:.2f}'
     }
-
     if not os.path.isfile(results_file):
         with open(results_file, 'w', newline='') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
@@ -208,32 +253,59 @@ def test(args, models, test_data, split_indices, config):
             writer.writerow(new_record)
     else:
         df = pd.read_csv(results_file)
-        existing_index = df[(df['algorithm'] == 'BWL') & (df['dataset'] == args.dataset)].index
+        existing_index = df[(df['algorithm'] == new_record['algorithm']) & (df['dataset'] == args.dataset)].index
         if not existing_index.empty:
             df.loc[existing_index, list(new_record.keys())] = list(new_record.values())
         else:
             new_df = pd.DataFrame([new_record])
             df = pd.concat([df, new_df], ignore_index=True)
         df.to_csv(results_file, index=False)
-        
     print(f"结果已更新/保存到 {results_file}")
 
-# --- 主程序执行 ---
+# ============================== Main Execution ==============================
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="运行BWL算法，训练并立即测试.")
-    parser.add_argument('--dataset', type=str, required=True, choices=['bcw', 'cifar10', 'cinic10'], help='用于训练和测试的数据集.')
-    parser.add_argument('--epochs', type=int, default=10, help='训练周期数.')
-    parser.add_argument('--lr', type=float, default=0.001, help='学习率.')
-    parser.add_argument('--batch_size', type=int, default=64, help='批处理大小.')
+    parser = argparse.ArgumentParser(description="Passive Label Inference Attack on BWL-defended VFL.")
+    parser.add_argument('--dataset', type=str, required=True, choices=['bcw', 'cifar10', 'cinic10'], help='Dataset for the attack.')
+    parser.add_argument('--epochs', type=int, default=10, help='Number of VFL training epochs.')
+    parser.add_argument('--attack_epochs', type=int, default=10, help='Number of attack model training epochs.')
+    parser.add_argument('--lr', type=float, default=0.001, help='Learning rate.')
+    parser.add_argument('--batch_size', type=int, default=64, help='Batch size.')
     parser.add_argument('--alpha', type=float, default=1, help='边界徘徊损失的权重.')
-    parser.add_argument('--print_freq', type=int, default=10, help='每多少个batch输出一次训练进度.')
+    parser.add_argument('--aux_data_ratio', type=float, default=0.1, help='Ratio of training data to use as auxiliary data.')
     
     args = parser.parse_args()
 
     log_dir = 'result'
     os.makedirs(log_dir, exist_ok=True)
-    log_file_path = os.path.join(log_dir, f'bwl_{args.dataset}_results.txt')
+    log_file_path = os.path.join(log_dir, f'passive_lia_on_bwl_{args.dataset}_results.txt')
     sys.stdout = Logger(log_file_path, sys.stdout)
+
+    print(f"========== 开始在 {args.dataset} 上进行 Passive LIA on BWL ==========")
     
-    trained_models, test_data, split_indices, config = train(args)
-    test(args, trained_models, test_data, split_indices, config)
+    data_loader = DATA_LOADER_MAP[args.dataset]
+    (X_a_train_full, X_b_train_full, y_train_full), (X_a_test, X_b_test, y_test) = data_loader()
+
+    indices = np.arange(len(X_a_train_full))
+    train_indices, aux_indices = train_test_split(indices, test_size=args.aux_data_ratio, random_state=42)
+    
+    X_a_vfl, y_vfl = X_a_train_full[train_indices], y_train_full[train_indices]
+    X_b_vfl = X_b_train_full[train_indices]
+    X_a_aux, y_aux = X_a_train_full[aux_indices], y_train_full[aux_indices]
+
+    print(f"数据切分完成: VFL训练数据 {len(y_vfl)} 条, 攻击者辅助数据 {len(y_aux)} 条。")
+
+    # 1. 训练BWL模型
+    bwl_models, split_indices, config = train_bwl(args, X_a_vfl, X_b_vfl, y_vfl)
+    
+    # 2. 评估BWL模型性能
+    main_acc, shadow_acc = test_bwl(args, bwl_models, (X_a_test, X_b_test, y_test), split_indices, config)
+
+    # 3. 提取攻击者模型并进行攻击
+    party_a_model_cpu = bwl_models[0].to('cpu')
+    attack_model = train_attack_model(args, party_a_model_cpu, X_a_aux, y_aux)
+    attack_accuracy = perform_inference(args, attack_model, X_a_test, y_test)
+
+    # 4. 保存所有结果
+    save_results(args, main_acc, shadow_acc, attack_accuracy)
+
+    print(f"========== Passive LIA on BWL 流程结束 ==========")

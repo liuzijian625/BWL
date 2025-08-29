@@ -11,7 +11,7 @@ import pandas as pd
 import models.architectures as arch
 from utils.data_loader import load_bcw, load_cifar10, load_cinic10, create_dataloader
 
-# --- 日志记录类 (同时输出到屏幕和文件) ---
+# --- 日志记录类 ---
 class Logger(object):
     def __init__(self, filename="default.log", stream=sys.stdout):
         self.terminal = stream
@@ -66,51 +66,27 @@ def train(args):
 
     top_model = MODEL_MAP[model_config['top_model']](input_dim=embedding_dim * 2, output_dim=num_classes)
     
-    # 将所有模型移动到GPU
-    party_a_model = party_a_model.to(device)
-    party_b_model = party_b_model.to(device)
-    top_model = top_model.to(device)
+    party_a_model, party_b_model, top_model = party_a_model.to(device), party_b_model.to(device), top_model.to(device)
 
     optimizers = [optim.Adam(m.parameters(), lr=args.lr) for m in [party_a_model, party_b_model, top_model]]
     criterion = nn.CrossEntropyLoss()
 
     print(f"--- 开始在 {args.dataset} 数据集上进行原版VFL训练 (共 {args.epochs} 个周期) ---")
     
-    total_batches = len(train_loader)
-    print(f"每个周期包含 {total_batches} 个批次")
-
     for epoch in range(args.epochs):
         epoch_loss = 0.0
-        
         for i, (batch_X_a, batch_X_b, batch_y) in enumerate(train_loader):
-            # 将数据移动到GPU
-            batch_X_a = batch_X_a.to(device)
-            batch_X_b = batch_X_b.to(device)
-            batch_y = batch_y.to(device)
-            
+            batch_X_a, batch_X_b, batch_y = batch_X_a.to(device), batch_X_b.to(device), batch_y.to(device)
             for opt in optimizers: opt.zero_grad()
-
             E_a = party_a_model(batch_X_a)
             E_b = party_b_model(batch_X_b)
             E_fused = torch.cat((E_a, E_b), dim=1)
             prediction = top_model(E_fused)
-            
             loss = criterion(prediction, batch_y)
             loss.backward()
             for opt in optimizers: opt.step()
-            
-            # 累积损失
             epoch_loss += loss.item()
-            
-            # 细粒度输出
-            if (i + 1) % args.print_freq == 0 or (i + 1) == total_batches:
-                avg_loss = epoch_loss / (i + 1)
-                print(f'周期 [{epoch+1}/{args.epochs}], 批次 [{i+1}/{total_batches}], '
-                      f'损失: {loss.item():.4f}, 平均损失: {avg_loss:.4f}')
-
-        # 周期结束输出
-        avg_loss = epoch_loss / total_batches
-        print(f'=== 周期 [{epoch+1}/{args.epochs}] 完成 === 平均损失: {avg_loss:.4f}')
+        print(f'=== 周期 [{epoch+1}/{args.epochs}] 完成 === 平均损失: {epoch_loss / len(train_loader):.4f}')
 
     print("--- 训练结束 ---")
     
@@ -132,10 +108,7 @@ def test(args, models, test_data, config):
     correct, total = 0, 0
     with torch.no_grad():
         for batch_X_a, batch_X_b, batch_y in test_loader:
-            # 将数据移动到GPU
-            batch_X_a = batch_X_a.to(device)
-            batch_X_b = batch_X_b.to(device)
-            batch_y = batch_y.to(device)
+            batch_X_a, batch_X_b, batch_y = batch_X_a.to(device), batch_X_b.to(device), batch_y.to(device)
             E_a = party_a_model(batch_X_a)
             E_b = party_b_model(batch_X_b)
             E_fused = torch.cat((E_a, E_b), dim=1)
@@ -144,39 +117,36 @@ def test(args, models, test_data, config):
             total += batch_y.size(0)
             correct += (predicted == batch_y).sum().item()
 
-    print(f'原版VFL模型在 {args.dataset} 测试集上的准确率: {100 * correct / total:.2f} %')
+    main_acc_val = 100 * correct / total if total > 0 else 0
+    print(f'Vanilla VFL Main Accuracy on {args.dataset} test set: {main_acc_val:.2f} %')
 
-    # 将结果保存到CSV文件
+    # 保存或更新结果
     results_file = os.path.join('result', 'results.csv')
-    main_task_acc = f'{100 * correct / total:.2f}'
-    
-    should_write_header = not os.path.isfile(results_file)
+    fieldnames = ['algorithm', 'dataset', 'main_accuracy', 'shadow_accuracy', 'attack_accuracy']
+    new_record = {
+        'algorithm': 'Vanilla_VFL',
+        'dataset': args.dataset,
+        'main_accuracy': f'{main_acc_val:.2f}',
+        'shadow_accuracy': 'N/A',
+        'attack_accuracy': 'N/A'
+    }
 
-    # 检查重复
-    if not should_write_header:
-        try:
-            existing_df = pd.read_csv(results_file)
-            record_exists = ((existing_df['algorithm'] == 'Vanilla_VFL') &
-                           (existing_df['dataset'] == args.dataset) &
-                           (existing_df['main_task_accuracy'] == main_task_acc)).any()
-            if record_exists:
-                print("结果已存在于CSV文件中，跳过重复记录。")
-                return
-        except (pd.errors.EmptyDataError, FileNotFoundError):
-            pass
-
-    with open(results_file, 'a', newline='', encoding='utf-8') as csvfile:
-        fieldnames = ['algorithm', 'dataset', 'main_task_accuracy', 'attack_accuracy']
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        if should_write_header:
+    if not os.path.isfile(results_file):
+        with open(results_file, 'w', newline='') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
-        writer.writerow({
-            'algorithm': 'Vanilla_VFL',
-            'dataset': args.dataset,
-            'main_task_accuracy': main_task_acc,
-            'attack_accuracy': 'N/A'
-        })
-    print(f"结果已保存到 {results_file}")
+            writer.writerow(new_record)
+    else:
+        df = pd.read_csv(results_file)
+        existing_index = df[(df['algorithm'] == 'Vanilla_VFL') & (df['dataset'] == args.dataset)].index
+        if not existing_index.empty:
+            df.loc[existing_index, list(new_record.keys())] = list(new_record.values())
+        else:
+            new_df = pd.DataFrame([new_record])
+            df = pd.concat([df, new_df], ignore_index=True)
+        df.to_csv(results_file, index=False)
+        
+    print(f"结果已更新/保存到 {results_file}")
 
 # --- 主程序执行 ---
 if __name__ == '__main__':
@@ -189,7 +159,6 @@ if __name__ == '__main__':
     
     args = parser.parse_args()
 
-    # 设置日志
     log_dir = 'result'
     os.makedirs(log_dir, exist_ok=True)
     log_file_path = os.path.join(log_dir, f'vanilla_{args.dataset}_results.txt')

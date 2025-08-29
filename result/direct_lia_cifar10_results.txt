@@ -1,0 +1,11 @@
+========== 开始在 cifar10 上进行直接LIA攻击 ==========
+加载CIFAR-10数据集...
+CIFAR-10数据集加载和预处理完成.
+--- 开始在 cifar10 上进行直接LIA攻击训练 ---
+--- 开始VFL训练并同步进行梯度分析 ---
+--- 训练和攻击结束 ---
+Direct LIA Attack Accuracy on cifar10 train set: 100.00 %
+--- 评估直接攻击场景下的VFL主任务性能 ---
+VFL Main Accuracy on cifar10 test set: 63.59 %
+结果已更新/保存到 result/results.csv
+========== 直接LIA攻击流程结束 ==========

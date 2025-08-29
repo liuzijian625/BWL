@@ -1,0 +1,11 @@
+========== 开始在 bcw 上进行 Direct LIA w/ BWL Defense ==========
+加载BCW数据集...
+BCW数据集加载和预处理完成.
+--- 开始在 bcw 上进行带BWL防御的直接LIA场景训练 ---
+--- 开始VFL训练并同步进行梯度分析 (BWL防御已激活) ---
+--- 训练和攻击结束 ---
+Direct LIA (在BWL防御下) 在 bcw 训练集上的准确率: 54.07 %
+--- 评估防御后的VFL主任务性能 ---
+VFL Main Accuracy on bcw test set: 77.19 %
+结果已更新/保存到 result/results.csv
+========== Direct LIA w/ BWL Defense 流程结束 ==========

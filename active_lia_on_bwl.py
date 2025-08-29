@@ -1,16 +1,18 @@
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import argparse
 import json
+import numpy as np
 import sys
 import os
-import numpy as np
 import csv
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
 import models.architectures as arch
+from losses.boundary_wandering_loss import boundary_wandering_loss
 from utils.data_loader import load_bcw, load_cifar10, load_cinic10, create_dataloader
 
 # --- 日志记录类 ---
@@ -30,9 +32,16 @@ class Logger(object):
 # --- 模型与数据加载器的映射 ---
 MODEL_MAP = {
     "FCNN_Bottom": arch.FCNN_Bottom,
+    "FCNN_Shadow": arch.FCNN_Shadow,
+    "FCNN_Private": arch.FCNN_Private,
     "ResNet18_Bottom": arch.ResNet18_Bottom,
+    "ResNet18_Shadow": arch.ResNet18_Shadow,
+    "ResNet18_Private": arch.ResNet18_Private,
     "FCNN_Top_3": arch.FCNN_Top_3,
     "FCNN_Top_4": arch.FCNN_Top_4,
+    "FCNN_Main_Top_3": arch.FCNN_Main_Top_3,
+    "FCNN_Main_Top_4": arch.FCNN_Main_Top_4,
+    "LocalHead": arch.LocalHead
 }
 
 DATA_LOADER_MAP = {
@@ -41,7 +50,7 @@ DATA_LOADER_MAP = {
     "cinic10": load_cinic10
 }
 
-# ============================== Malicious Optimizer for Active LIA ==============================
+# ============================== Malicious Optimizer (from active_lia.py) ==============================
 class MaliciousOptimizer:
     def __init__(self, optimizer, eta=0.2, gamma=0.1):
         self.optimizer = optimizer
@@ -71,84 +80,142 @@ class MaliciousOptimizer:
                 param_idx += 1
         self.optimizer.step()
 
-# ============================== Phase 1: Malicious VFL Training ==============================
-def train_vfl(args, X_a_vfl, X_b_vfl, y_vfl):
+# ============================== Phase 1: BWL VFL Training with Active Attacker ==============================
+def train_bwl_active(args, X_a_train, X_b_train, y_train):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"--- Phase 1: 在VFL数据上进行主动(恶意)VFL训练 ---")
+    print(f"--- Phase 1: 在VFL数据上进行带主动攻击的BWL训练 ---")
     
     with open('config.json', 'r') as f:
         config = json.load(f)[args.dataset]
     params = config['params']
-    model_config = config['vanilla']
+    model_config = config['bwl']
 
-    vfl_loader = create_dataloader(X_a_vfl, X_b_vfl, y_vfl, batch_size=args.batch_size)
+    train_loader = create_dataloader(X_a_train, X_b_train, y_train, batch_size=args.batch_size)
+
+    if config['model_type'] == 'fcnn':
+        total_b_features = params['party_b_features']
+        ratio = params['public_feature_ratio']
+        num_public = int(total_b_features * ratio)
+        indices = np.arange(total_b_features)
+        np.random.shuffle(indices)
+        public_indices, private_indices = indices[:num_public], indices[num_public:]
+        num_public_features = len(public_indices)
+        num_private_features = len(private_indices)
+    else:
+        public_indices, private_indices = None, None
 
     embedding_dim = params['embedding_dim']
     num_classes = params['num_classes']
 
     if config['model_type'] == 'fcnn':
         party_a_model = MODEL_MAP[model_config['bottom_model_party_a']](input_dim=params['party_a_features'], output_dim=embedding_dim)
-        party_b_model = MODEL_MAP[model_config['bottom_model_party_b']](input_dim=params['party_b_features'], output_dim=embedding_dim)
-    else: # resnet
+        public_model = MODEL_MAP[model_config['bottom_model_public']](input_dim=num_public_features, output_dim=embedding_dim)
+        private_model = MODEL_MAP[model_config['bottom_model_private']](input_dim=num_private_features, output_dim=embedding_dim)
+    else:
         party_a_model = MODEL_MAP[model_config['bottom_model_party_a']](output_dim=embedding_dim)
-        party_b_model = MODEL_MAP[model_config['bottom_model_party_b']](output_dim=embedding_dim)
+        public_model = MODEL_MAP[model_config['bottom_model_public']](output_dim=embedding_dim)
+        private_model = MODEL_MAP[model_config['bottom_model_private']](output_dim=embedding_dim)
 
-    top_model = MODEL_MAP[model_config['top_model']](input_dim=embedding_dim * 2, output_dim=num_classes)
+    shadow_top_model = MODEL_MAP[model_config['shadow_top_model']](input_dim=embedding_dim * 2, output_dim=num_classes)
+    main_top_model = MODEL_MAP[model_config['main_top_model']](input_dim=embedding_dim * 3, output_dim=num_classes)
     
-    party_a_model, party_b_model, top_model = party_a_model.to(device), party_b_model.to(device), top_model.to(device)
+    models_on_device = [m.to(device) for m in [party_a_model, public_model, private_model, shadow_top_model, main_top_model]]
+    party_a_model, public_model, private_model, shadow_top_model, main_top_model = models_on_device
 
+    # 使用恶意优化器攻击Party A
     optimizer_a = MaliciousOptimizer(optim.Adam(party_a_model.parameters(), lr=args.lr))
-    optimizer_b = optim.Adam(party_b_model.parameters(), lr=args.lr)
-    optimizer_top = optim.Adam(top_model.parameters(), lr=args.lr)
-    optimizers = [optimizer_a, optimizer_b, optimizer_top]
+    optimizers = [
+        optimizer_a,
+        optim.Adam(public_model.parameters(), lr=args.lr),
+        optim.Adam(private_model.parameters(), lr=args.lr),
+        optim.Adam(shadow_top_model.parameters(), lr=args.lr),
+        optim.Adam(main_top_model.parameters(), lr=args.lr)
+    ]
     criterion = nn.CrossEntropyLoss()
 
+    print(f"--- 开始在 {args.dataset} 数据集上进行BWL(主动攻击)训练 (共 {args.epochs} 个周期) ---")
     for epoch in range(args.epochs):
-        for i, (batch_X_a, batch_X_b, batch_y) in enumerate(vfl_loader):
+        for i, (batch_X_a, batch_X_b, batch_y) in enumerate(train_loader):
             batch_X_a, batch_X_b, batch_y = batch_X_a.to(device), batch_X_b.to(device), batch_y.to(device)
             for opt in optimizers: opt.zero_grad()
+
+            if config['model_type'] == 'fcnn':
+                batch_X_b_public, batch_X_b_private = batch_X_b[:, public_indices], batch_X_b[:, private_indices]
+            else:
+                batch_X_b_public, batch_X_b_private = batch_X_b[:, :, :16, :], batch_X_b[:, :, 16:, :]
+
             E_a = party_a_model(batch_X_a)
-            E_b = party_b_model(batch_X_b)
-            E_fused = torch.cat((E_a, E_b), dim=1)
-            prediction = top_model(E_fused)
-            loss = criterion(prediction, batch_y)
-            loss.backward()
-            for opt in optimizers: opt.step()
-        print(f'VFL(恶意)训练周期 [{epoch+1}/{args.epochs}] 完成, 损失: {loss.item():.4f}')
+            E_public = public_model(batch_X_b_public)
+            E_private = private_model(batch_X_b_private)
+            
+            E_fused_shadow = torch.cat((E_a, E_public), dim=1)
+            shadow_prediction = shadow_top_model(E_fused_shadow)
+            pred_loss = criterion(shadow_prediction, batch_y)
+            bw_loss = boundary_wandering_loss(E_public, batch_y)
+            shadow_loss = pred_loss + args.alpha * bw_loss
+            shadow_loss.backward(retain_graph=True)
+            
+            optimizers[0].step() # Malicious optimizer for Party A
+            optimizers[1].step()
+            optimizers[3].step()
 
-    print("--- VFL(恶意)训练结束 ---")
-    return party_a_model.to('cpu'), party_b_model, top_model
+            for p in list(private_model.parameters()) + list(main_top_model.parameters()): p.grad = None
 
-# ============================== Main Task Performance Evaluation ==============================
-def test_vfl(args, vfl_models, X_a_test, X_b_test, y_test):
+            E_fused_main = torch.cat((E_a.detach(), E_public.detach(), E_private), dim=1)
+            main_prediction = main_top_model(E_fused_main)
+            main_loss = criterion(main_prediction, batch_y)
+            main_loss.backward()
+            optimizers[2].step()
+            optimizers[4].step()
+        print(f'=== BWL(主动攻击)训练周期 [{epoch+1}/{args.epochs}] 完成 ===')
+
+    print("--- BWL(主动攻击)训练结束 ---")
+    return models_on_device, (public_indices, private_indices), config
+
+# ============================== BWL Performance Evaluation ==============================
+def test_bwl(args, models, test_data, split_indices, config):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print("--- 评估VFL主任务性能 ---")
-    party_a_model, party_b_model, top_model = vfl_models
-    
-    party_a_model = party_a_model.to(device)
-    party_a_model.eval()
-    party_b_model.eval()
-    top_model.eval()
+    print("--- 评估BWL模型性能 ---")
+    party_a_model, public_model, private_model, shadow_top_model, main_top_model = models
+    X_a_test, X_b_test, y_test = test_data
+    public_indices, private_indices = split_indices
 
     test_loader = create_dataloader(X_a_test, X_b_test, y_test, batch_size=args.batch_size, shuffle=False)
 
-    correct, total = 0, 0
+    for m in models: m.eval()
+
+    correct_shadow, correct_main, total = 0, 0, 0
     with torch.no_grad():
         for batch_X_a, batch_X_b, batch_y in test_loader:
             batch_X_a, batch_X_b, batch_y = batch_X_a.to(device), batch_X_b.to(device), batch_y.to(device)
+            if config['model_type'] == 'fcnn':
+                batch_X_b_public, batch_X_b_private = batch_X_b[:, public_indices], batch_X_b[:, private_indices]
+            else:
+                batch_X_b_public, batch_X_b_private = batch_X_b[:, :, :16, :], batch_X_b[:, :, 16:, :]
+
             E_a = party_a_model(batch_X_a)
-            E_b = party_b_model(batch_X_b)
-            E_fused = torch.cat((E_a, E_b), dim=1)
-            prediction = top_model(E_fused)
-            _, predicted = torch.max(prediction.data, 1)
+            E_public = public_model(batch_X_b_public)
+            E_private = private_model(batch_X_b_private)
+
+            E_fused_shadow = torch.cat((E_a, E_public), dim=1)
+            shadow_prediction = shadow_top_model(E_fused_shadow)
+            _, predicted_shadow = torch.max(shadow_prediction.data, 1)
+            
+            E_fused_main = torch.cat((E_a, E_public, E_private), dim=1)
+            main_prediction = main_top_model(E_fused_main)
+            _, predicted_main = torch.max(main_prediction.data, 1)
+
             total += batch_y.size(0)
-            correct += (predicted == batch_y).sum().item()
+            correct_shadow += (predicted_shadow == batch_y).sum().item()
+            correct_main += (predicted_main == batch_y).sum().item()
 
-    main_accuracy = 100 * correct / total if total > 0 else 0
-    print(f'VFL Main Accuracy on {args.dataset} test set: {main_accuracy:.2f} %')
-    return main_accuracy
+    shadow_acc = 100 * correct_shadow / total if total > 0 else 0
+    main_acc = 100 * correct_main / total if total > 0 else 0
+    print(f'BWL 影子准确率 (Shadow Accuracy) 在 {args.dataset} 测试集上: {shadow_acc:.2f} %')
+    print(f'BWL 真实准确率 (Main Accuracy) 在 {args.dataset} 测试集上: {main_acc:.2f} %')
+    return main_acc, shadow_acc
 
-# ============================== Phase 2 & 3: Attack Model Training ==============================
+# ============================== Attack Logic (from active_lia.py) ==============================
 class AttackModel(nn.Module):
     def __init__(self, feature_extractor, num_classes, embedding_dim):
         super(AttackModel, self).__init__()
@@ -162,23 +229,18 @@ class AttackModel(nn.Module):
 
 def train_attack_model(args, party_a_model, X_a_aux, y_aux):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"--- Phase 2 & 3: 在辅助数据上训练攻击模型 ---")
-
+    print(f"--- Phase 2: 在辅助数据上训练攻击模型 ---")
     with open('config.json', 'r') as f:
         config = json.load(f)[args.dataset]
     params = config['params']
-    
     aux_loader = create_dataloader(X_a_aux, torch.zeros(len(X_a_aux), 0), y_aux, batch_size=args.batch_size)
-
     attack_model = AttackModel(
         feature_extractor=party_a_model.to(device),
         num_classes=params['num_classes'],
         embedding_dim=params['embedding_dim']
     ).to(device)
-
     optimizer = optim.Adam(attack_model.classifier_head.parameters(), lr=args.lr)
     criterion = nn.CrossEntropyLoss()
-
     for epoch in range(args.attack_epochs):
         for batch_X_a, _, batch_y in aux_loader:
             batch_X_a, batch_y = batch_X_a.to(device), batch_y.to(device)
@@ -188,20 +250,15 @@ def train_attack_model(args, party_a_model, X_a_aux, y_aux):
             loss.backward()
             optimizer.step()
         print(f'攻击模型训练周期 [{epoch+1}/{args.attack_epochs}] 完成, 损失: {loss.item():.4f}')
-    
     print("--- 攻击模型训练结束 ---")
     return attack_model.to('cpu')
 
-# ============================== Phase 4: Inference ==============================
 def perform_inference(args, attack_model, X_a_test, y_test):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"--- Phase 4: 在测试集上进行标签推断 ---")
-    
+    print(f"--- Phase 3: 在测试集上进行标签推断 ---")
     attack_model = attack_model.to(device)
     attack_model.eval()
-
     test_loader = create_dataloader(X_a_test, torch.zeros(len(X_a_test), 0), y_test, batch_size=args.batch_size, shuffle=False)
-    
     correct, total = 0, 0
     with torch.no_grad():
         for batch_X_a, _, batch_y in test_loader:
@@ -210,23 +267,21 @@ def perform_inference(args, attack_model, X_a_test, y_test):
             _, predicted = torch.max(prediction.data, 1)
             total += batch_y.size(0)
             correct += (predicted == batch_y).sum().item()
-
     attack_accuracy = 100 * correct / total if total > 0 else 0
-    print(f'Active LIA Attack Accuracy on {args.dataset} test set: {attack_accuracy:.2f} %')
+    print(f'主动攻击在BWL防御下的准确率: {attack_accuracy:.2f} %')
     return attack_accuracy
 
 # ============================== Save Results ==============================
-def save_results(args, main_accuracy, attack_accuracy):
+def save_results(args, main_accuracy, shadow_accuracy, attack_accuracy):
     results_file = os.path.join('result', 'results.csv')
     fieldnames = ['algorithm', 'dataset', 'main_accuracy', 'shadow_accuracy', 'attack_accuracy']
     new_record = {
-        'algorithm': 'Active_LIA',
+        'algorithm': 'Active_LIA_on_BWL',
         'dataset': args.dataset,
         'main_accuracy': f'{main_accuracy:.2f}',
-        'shadow_accuracy': 'N/A',
+        'shadow_accuracy': f'{shadow_accuracy:.2f}',
         'attack_accuracy': f'{attack_accuracy:.2f}'
     }
-
     if not os.path.isfile(results_file):
         with open(results_file, 'w', newline='') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
@@ -234,34 +289,34 @@ def save_results(args, main_accuracy, attack_accuracy):
             writer.writerow(new_record)
     else:
         df = pd.read_csv(results_file)
-        existing_index = df[(df['algorithm'] == 'Active_LIA') & (df['dataset'] == args.dataset)].index
+        existing_index = df[(df['algorithm'] == new_record['algorithm']) & (df['dataset'] == args.dataset)].index
         if not existing_index.empty:
             df.loc[existing_index, list(new_record.keys())] = list(new_record.values())
         else:
             new_df = pd.DataFrame([new_record])
             df = pd.concat([df, new_df], ignore_index=True)
         df.to_csv(results_file, index=False)
-        
     print(f"结果已更新/保存到 {results_file}")
 
 # ============================== Main Execution ==============================
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Active Label Inference Attack on Vanilla VFL.")
+    parser = argparse.ArgumentParser(description="Active Label Inference Attack on BWL-defended VFL.")
     parser.add_argument('--dataset', type=str, required=True, choices=['bcw', 'cifar10', 'cinic10'], help='Dataset for the attack.')
     parser.add_argument('--epochs', type=int, default=10, help='Number of VFL training epochs.')
     parser.add_argument('--attack_epochs', type=int, default=10, help='Number of attack model training epochs.')
     parser.add_argument('--lr', type=float, default=0.001, help='Learning rate.')
     parser.add_argument('--batch_size', type=int, default=64, help='Batch size.')
-    parser.add_argument('--aux_data_ratio', type=float, default=0.1, help='Ratio of training data to use as auxiliary data for the attacker.')
+    parser.add_argument('--alpha', type=float, default=1, help='边界徘徊损失的权重.')
+    parser.add_argument('--aux_data_ratio', type=float, default=0.1, help='Ratio of training data to use as auxiliary data.')
     
     args = parser.parse_args()
 
     log_dir = 'result'
     os.makedirs(log_dir, exist_ok=True)
-    log_file_path = os.path.join(log_dir, f'active_lia_{args.dataset}_results.txt')
+    log_file_path = os.path.join(log_dir, f'active_lia_on_bwl_{args.dataset}_results.txt')
     sys.stdout = Logger(log_file_path, sys.stdout)
 
-    print(f"========== 开始在 {args.dataset} 上进行主动LIA攻击 ==========")
+    print(f"========== 开始在 {args.dataset} 上进行 Active LIA on BWL ==========")
     
     data_loader = DATA_LOADER_MAP[args.dataset]
     (X_a_train_full, X_b_train_full, y_train_full), (X_a_test, X_b_test, y_test) = data_loader()
@@ -275,14 +330,18 @@ if __name__ == '__main__':
 
     print(f"数据切分完成: VFL训练数据 {len(y_vfl)} 条, 攻击者辅助数据 {len(y_aux)} 条。")
 
-    party_a_model_cpu, party_b_model, top_model = train_vfl(args, X_a_vfl, X_b_vfl, y_vfl)
+    # 1. 训练BWL模型
+    bwl_models, split_indices, config = train_bwl_active(args, X_a_vfl, X_b_vfl, y_vfl)
+    
+    # 2. 评估BWL模型性能
+    main_acc, shadow_acc = test_bwl(args, bwl_models, (X_a_test, X_b_test, y_test), split_indices, config)
 
-    main_accuracy = test_vfl(args, (party_a_model_cpu, party_b_model, top_model), X_a_test, X_b_test, y_test)
-
+    # 3. 提取攻击者模型并进行攻击
+    party_a_model_cpu = bwl_models[0].to('cpu')
     attack_model = train_attack_model(args, party_a_model_cpu, X_a_aux, y_aux)
-
     attack_accuracy = perform_inference(args, attack_model, X_a_test, y_test)
 
-    save_results(args, main_accuracy, attack_accuracy)
+    # 4. 保存所有结果
+    save_results(args, main_acc, shadow_acc, attack_accuracy)
 
-    print(f"========== 主动LIA攻击流程结束 ==========")
+    print(f"========== Active LIA on BWL 流程结束 ==========")
