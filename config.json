@@ -1,0 +1,59 @@
+{
+  "bcw": {
+    "model_type": "fcnn",
+    "params": {
+      "party_a_features": 15,
+      "party_b_features": 15,
+      "public_feature_ratio": 0.5,
+      "num_classes": 2,
+      "embedding_dim": 8
+    },
+    "bwl": {
+      "bottom_model_party_a": "FCNN_Bottom",
+      "bottom_model_shadow": "FCNN_Shadow",
+      "bottom_model_private": "FCNN_Private",
+      "top_model": "FCNN_Top_3"
+    },
+    "vanilla": {
+      "bottom_model_party_a": "FCNN_Bottom",
+      "bottom_model_party_b": "FCNN_Bottom",
+      "top_model": "FCNN_Top_3"
+    }
+  },
+  "cifar10": {
+    "model_type": "resnet",
+    "params": {
+      "num_classes": 10,
+      "embedding_dim": 128
+    },
+    "bwl": {
+      "bottom_model_party_a": "ResNet18_Bottom",
+      "bottom_model_shadow": "ResNet18_Shadow",
+      "bottom_model_private": "ResNet18_Private",
+      "top_model": "FCNN_Top_4"
+    },
+    "vanilla": {
+      "bottom_model_party_a": "ResNet18_Bottom",
+      "bottom_model_party_b": "ResNet18_Bottom",
+      "top_model": "FCNN_Top_4"
+    }
+  },
+  "cinic10": {
+    "model_type": "resnet",
+    "params": {
+      "num_classes": 10,
+      "embedding_dim": 128
+    },
+    "bwl": {
+      "bottom_model_party_a": "ResNet18_Bottom",
+      "bottom_model_shadow": "ResNet18_Shadow",
+      "bottom_model_private": "ResNet18_Private",
+      "top_model": "FCNN_Top_4"
+    },
+    "vanilla": {
+      "bottom_model_party_a": "ResNet18_Bottom",
+      "bottom_model_party_b": "ResNet18_Bottom",
+      "top_model": "FCNN_Top_4"
+    }
+  }
+}
