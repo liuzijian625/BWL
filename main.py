@@ -38,6 +38,8 @@ MODEL_MAP = {
     "ResNet18_Private": arch.ResNet18_Private,
     "FCNN_Top_3": arch.FCNN_Top_3,
     "FCNN_Top_4": arch.FCNN_Top_4,
+    "FCNN_Main_Top_3": arch.FCNN_Main_Top_3,
+    "FCNN_Main_Top_4": arch.FCNN_Main_Top_4,
     "LocalHead": arch.LocalHead
 }
 
@@ -78,24 +80,31 @@ def train(args):
 
     if config['model_type'] == 'fcnn':
         party_a_model = MODEL_MAP[model_config['bottom_model_party_a']](input_dim=params['party_a_features'], output_dim=embedding_dim)
-        shadow_model = MODEL_MAP[model_config['bottom_model_shadow']](input_dim=num_public_features, output_dim=embedding_dim)
+        public_model = MODEL_MAP[model_config['bottom_model_public']](input_dim=num_public_features, output_dim=embedding_dim)
         private_model = MODEL_MAP[model_config['bottom_model_private']](input_dim=num_private_features, output_dim=embedding_dim)
     else:
         party_a_model = MODEL_MAP[model_config['bottom_model_party_a']](output_dim=embedding_dim)
-        shadow_model = MODEL_MAP[model_config['bottom_model_shadow']](output_dim=embedding_dim)
+        public_model = MODEL_MAP[model_config['bottom_model_public']](output_dim=embedding_dim)
         private_model = MODEL_MAP[model_config['bottom_model_private']](output_dim=embedding_dim)
 
-    top_model = MODEL_MAP[model_config['top_model']](input_dim=embedding_dim * 2, output_dim=num_classes)
-    local_head = MODEL_MAP['LocalHead'](input_dim=embedding_dim * 2, output_dim=num_classes)
+    # 双轨顶层模型
+    shadow_top_model = MODEL_MAP[model_config['shadow_top_model']](input_dim=embedding_dim * 2, output_dim=num_classes)  # E_A + E_public
+    main_top_model = MODEL_MAP[model_config['main_top_model']](input_dim=embedding_dim * 3, output_dim=num_classes)  # E_A + E_public + E_private
     
     # 将所有模型移动到GPU
     party_a_model = party_a_model.to(device)
-    shadow_model = shadow_model.to(device)
+    public_model = public_model.to(device)
     private_model = private_model.to(device)
-    top_model = top_model.to(device)
-    local_head = local_head.to(device)
+    shadow_top_model = shadow_top_model.to(device)
+    main_top_model = main_top_model.to(device)
 
-    optimizers = [optim.Adam(m.parameters(), lr=args.lr) for m in [party_a_model, shadow_model, private_model, top_model, local_head]]
+    optimizers = [
+        optim.Adam(party_a_model.parameters(), lr=args.lr),
+        optim.Adam(public_model.parameters(), lr=args.lr),
+        optim.Adam(private_model.parameters(), lr=args.lr),
+        optim.Adam(shadow_top_model.parameters(), lr=args.lr),
+        optim.Adam(main_top_model.parameters(), lr=args.lr)
+    ]
     criterion = nn.CrossEntropyLoss()
 
     print(f"--- 开始在 {args.dataset} 数据集上进行BWL训练 (共 {args.epochs} 个周期) ---")
@@ -113,8 +122,10 @@ def train(args):
             batch_X_b = batch_X_b.to(device)
             batch_y = batch_y.to(device)
             
+            # 清零梯度
             for opt in optimizers: opt.zero_grad()
 
+            # 特征分割
             if config['model_type'] == 'fcnn':
                 batch_X_b_public = batch_X_b[:, public_indices]
                 batch_X_b_private = batch_X_b[:, private_indices]
@@ -122,25 +133,38 @@ def train(args):
                 batch_X_b_public = batch_X_b[:, :, :16, :]
                 batch_X_b_private = batch_X_b[:, :, 16:, :]
 
+            # 前向传播 - 计算嵌入
             E_a = party_a_model(batch_X_a)
-            E_shadow = shadow_model(batch_X_b_public)
+            E_public = public_model(batch_X_b_public)
             E_private = private_model(batch_X_b_private)
-            E_fused_top = torch.cat((E_a, E_shadow), dim=1)
-            prediction = top_model(E_fused_top)
             
-            pred_loss = criterion(prediction, batch_y)
-            bw_loss = boundary_wandering_loss(E_shadow, batch_y)
-            total_loss = pred_loss + args.alpha * bw_loss
+            # === 轨道一：联邦混淆轨道 (Shadow Track) ===
+            E_fused_shadow = torch.cat((E_a, E_public), dim=1)
+            shadow_prediction = shadow_top_model(E_fused_shadow)
+            
+            pred_loss = criterion(shadow_prediction, batch_y)
+            bw_loss = boundary_wandering_loss(E_public, batch_y)
+            shadow_loss = pred_loss + args.alpha * bw_loss
 
-            total_loss.backward(retain_graph=True)
-            optimizers[0].step(); optimizers[3].step(); optimizers[1].step()
-
-            optimizers[2].zero_grad(); optimizers[4].zero_grad()
-            E_fused_local = torch.cat((E_shadow.detach(), E_private), dim=1)
-            local_prediction = local_head(E_fused_local)
-            local_loss = criterion(local_prediction, batch_y)
-            local_loss.backward()
-            optimizers[2].step(); optimizers[4].step()
+            # 轨道一反向传播（更新Party A、公开模型和影子顶层模型）
+            shadow_loss.backward(retain_graph=True)
+            optimizers[0].step()  # party_a_model
+            optimizers[1].step()  # public_model  
+            optimizers[3].step()  # shadow_top_model
+            
+            # === 轨道二：本地保真轨道 (Main Track) ===
+            optimizers[2].zero_grad()  # private_model
+            optimizers[4].zero_grad()  # main_top_model
+            
+            # 使用所有嵌入（但需要detach防止梯度流回）
+            E_fused_main = torch.cat((E_a.detach(), E_public.detach(), E_private), dim=1)
+            main_prediction = main_top_model(E_fused_main)
+            main_loss = criterion(main_prediction, batch_y)
+            
+            # 轨道二反向传播（仅更新私有模型和主顶层模型）
+            main_loss.backward()
+            optimizers[2].step()  # private_model
+            optimizers[4].step()  # main_top_model
             
             # 累积损失
             epoch_pred_loss += pred_loss.item()
@@ -151,18 +175,18 @@ def train(args):
                 avg_pred_loss = epoch_pred_loss / (i + 1)
                 avg_bw_loss = epoch_bw_loss / (i + 1)
                 print(f'周期 [{epoch+1}/{args.epochs}], 批次 [{i+1}/{total_batches}], '
-                      f'预测损失: {pred_loss.item():.4f}, 边界徘徊损失: {bw_loss.item():.4f}, '
-                      f'平均预测损失: {avg_pred_loss:.4f}, 平均边界徘徊损失: {avg_bw_loss:.4f}')
+                      f'影子损失: {pred_loss.item():.4f}, 边界徘徊损失: {bw_loss.item():.4f}, '
+                      f'保真损失: {main_loss.item():.4f}, 平均影子损失: {avg_pred_loss:.4f}')
 
         # 周期结束输出
         avg_pred_loss = epoch_pred_loss / total_batches
         avg_bw_loss = epoch_bw_loss / total_batches
         print(f'=== 周期 [{epoch+1}/{args.epochs}] 完成 === '
-              f'平均预测损失: {avg_pred_loss:.4f}, 平均边界徘徊损失: {avg_bw_loss:.4f}')
+              f'平均影子损失: {avg_pred_loss:.4f}, 平均边界徘徊损失: {avg_bw_loss:.4f}')
 
     print("--- 训练结束 ---")
     
-    models = (party_a_model, shadow_model, private_model, top_model, local_head)
+    models = (party_a_model, public_model, private_model, shadow_top_model, main_top_model)
     test_data = (X_a_test, X_b_test, y_test)
     split_indices = (public_indices, private_indices)
     return models, test_data, split_indices, config
@@ -171,7 +195,7 @@ def train(args):
 def test(args, models, test_data, split_indices, config):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print("--- 开始测试 ---")
-    party_a_model, shadow_model, private_model, top_model, local_head = models
+    party_a_model, public_model, private_model, shadow_top_model, main_top_model = models
     X_a_test, X_b_test, y_test = test_data
     public_indices, private_indices = split_indices
 
@@ -179,13 +203,15 @@ def test(args, models, test_data, split_indices, config):
 
     for m in models: m.eval()
 
-    correct_global, correct_local, total = 0, 0, 0
+    correct_shadow, correct_main, total = 0, 0, 0
     with torch.no_grad():
         for batch_X_a, batch_X_b, batch_y in test_loader:
             # 将数据移动到GPU
             batch_X_a = batch_X_a.to(device)
             batch_X_b = batch_X_b.to(device)
             batch_y = batch_y.to(device)
+            
+            # 特征分割
             if config['model_type'] == 'fcnn':
                 batch_X_b_public = batch_X_b[:, public_indices]
                 batch_X_b_private = batch_X_b[:, private_indices]
@@ -193,62 +219,61 @@ def test(args, models, test_data, split_indices, config):
                 batch_X_b_public = batch_X_b[:, :, :16, :]
                 batch_X_b_private = batch_X_b[:, :, 16:, :]
 
+            # 计算嵌入
             E_a = party_a_model(batch_X_a)
-            E_shadow = shadow_model(batch_X_b_public)
+            E_public = public_model(batch_X_b_public)
             E_private = private_model(batch_X_b_private)
 
-            E_fused_top = torch.cat((E_a, E_shadow), dim=1)
-            global_prediction = top_model(E_fused_top)
-            _, predicted_global = torch.max(global_prediction.data, 1)
+            # 影子轨道预测（联邦混淆轨道）
+            E_fused_shadow = torch.cat((E_a, E_public), dim=1)
+            shadow_prediction = shadow_top_model(E_fused_shadow)
+            _, predicted_shadow = torch.max(shadow_prediction.data, 1)
             
-            E_fused_local = torch.cat((E_shadow, E_private), dim=1)
-            local_prediction = local_head(E_fused_local)
-            _, predicted_local = torch.max(local_prediction.data, 1)
+            # 保真轨道预测（本地保真轨道）
+            E_fused_main = torch.cat((E_a, E_public, E_private), dim=1)
+            main_prediction = main_top_model(E_fused_main)
+            _, predicted_main = torch.max(main_prediction.data, 1)
 
             total += batch_y.size(0)
-            correct_global += (predicted_global == batch_y).sum().item()
-            correct_local += (predicted_local == batch_y).sum().item()
+            correct_shadow += (predicted_shadow == batch_y).sum().item()
+            correct_main += (predicted_main == batch_y).sum().item()
 
-    print(f'BWL全局模型在 {args.dataset} 测试集上的准确率: {100 * correct_global / total:.2f} %')
-    print(f'BWL防御方本地模型在 {args.dataset} 测试集上的准确率: {100 * correct_local / total:.2f} %')
+    print(f'BWL影子轨道（联邦）在 {args.dataset} 测试集上的准确率: {100 * correct_shadow / total:.2f} %')
+    print(f'BWL保真轨道（本地）在 {args.dataset} 测试集上的准确率: {100 * correct_main / total:.2f} %')
 
-    # 将结果保存到CSV文件（避免重复记录）
+    # 将结果保存到CSV文件
     results_file = os.path.join('result', 'results.csv')
-    global_acc = f'{100 * correct_global / total:.2f}'
-    local_acc = f'{100 * correct_local / total:.2f}'
+    main_task_acc = f'{100 * correct_shadow / total:.2f}'
+    # local_acc = f'{100 * correct_main / total:.2f}' # local_acc 仅记录在日志中
     
-    # 检查是否已存在相同的记录
-    should_write = True
-    if os.path.isfile(results_file):
+    should_write_header = not os.path.isfile(results_file)
+
+    # 检查重复
+    if not should_write_header:
         try:
             existing_df = pd.read_csv(results_file)
-            # 检查是否已有相同的算法、数据集、全局准确率和本地准确率的记录
-            duplicate = existing_df[
-                (existing_df['algorithm'] == 'BWL') &
-                (existing_df['dataset'] == args.dataset) &
-                (existing_df['global_accuracy'] == global_acc) &
-                (existing_df['local_accuracy'] == local_acc)
-            ]
-            if not duplicate.empty:
-                print(f"结果已存在于CSV文件中，跳过重复记录")
-                should_write = False
+            # 检查是否已有相同的算法、数据集和主任务准确率的记录
+            record_exists = ((existing_df['algorithm'] == 'BWL') &
+                           (existing_df['dataset'] == args.dataset) &
+                           (existing_df['main_task_accuracy'] == main_task_acc)).any()
+            if record_exists:
+                print("结果已存在于CSV文件中，跳过重复记录。")
+                return
         except (pd.errors.EmptyDataError, FileNotFoundError):
-            should_write = True
-    
-    if should_write:
-        file_exists = os.path.isfile(results_file)
-        with open(results_file, 'a', newline='', encoding='utf-8') as csvfile:
-            fieldnames = ['algorithm', 'dataset', 'global_accuracy', 'local_accuracy']
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            if not file_exists:
-                writer.writeheader()
-            writer.writerow({
-                'algorithm': 'BWL',
-                'dataset': args.dataset,
-                'global_accuracy': global_acc,
-                'local_accuracy': local_acc
-            })
-            print(f"结果已保存到 {results_file}")
+            pass
+
+    with open(results_file, 'a', newline='', encoding='utf-8') as csvfile:
+        fieldnames = ['algorithm', 'dataset', 'main_task_accuracy', 'attack_accuracy']
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        if should_write_header:
+            writer.writeheader()
+        writer.writerow({
+            'algorithm': 'BWL',
+            'dataset': args.dataset,
+            'main_task_accuracy': main_task_acc,
+            'attack_accuracy': 'N/A'
+        })
+    print(f"结果已保存到 {results_file}")
 
 # --- 主程序执行 ---
 if __name__ == '__main__':

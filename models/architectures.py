@@ -128,6 +128,35 @@ class FCNN_Top_4(nn.Module):
         x = self.fc4(x)
         return x
 
+# 保真轨道专用的顶层模型（3个嵌入输入）
+class FCNN_Main_Top_3(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super(FCNN_Main_Top_3, self).__init__()
+        self.fc1 = nn.Linear(input_dim, 384)  # 更大的第一层以处理3个嵌入
+        self.fc2 = nn.Linear(384, 192)
+        self.fc3 = nn.Linear(192, output_dim)
+        self.relu = nn.ReLU()
+    def forward(self, x):
+        x = self.relu(self.fc1(x))
+        x = self.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
+
+class FCNN_Main_Top_4(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super(FCNN_Main_Top_4, self).__init__()
+        self.fc1 = nn.Linear(input_dim, 768)  # 更大的第一层以处理3个嵌入
+        self.fc2 = nn.Linear(768, 384)
+        self.fc3 = nn.Linear(384, 192)
+        self.fc4 = nn.Linear(192, output_dim)
+        self.relu = nn.ReLU()
+    def forward(self, x):
+        x = self.relu(self.fc1(x))
+        x = self.relu(self.fc2(x))
+        x = self.relu(self.fc3(x))
+        x = self.fc4(x)
+        return x
+
 # --- Generic Local Head for BWL ---
 
 class LocalHead(nn.Module):

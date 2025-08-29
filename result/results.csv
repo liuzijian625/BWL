@@ -1,7 +1,7 @@
 algorithm,dataset,global_accuracy,local_accuracy
-BWL,bcw,96.49,94.74
+BWL,bcw,97.37,97.37
 Vanilla_VFL,bcw,97.37,N/A
-BWL,cifar10,72.09,64.55
-Vanilla_VFL,cifar10,78.55,N/A
-BWL,cinic10,61.51,53.13
-Vanilla_VFL,cinic10,65.94,N/A
+BWL,cifar10,73.25,74.39
+Vanilla_VFL,cifar10,78.44,N/A
+BWL,cinic10,62.07,63.10
+Vanilla_VFL,cinic10,65.23,N/A

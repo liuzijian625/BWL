@@ -146,42 +146,37 @@ def test(args, models, test_data, config):
 
     print(f'原版VFL模型在 {args.dataset} 测试集上的准确率: {100 * correct / total:.2f} %')
 
-    # 将结果保存到CSV文件（避免重复记录）
+    # 将结果保存到CSV文件
     results_file = os.path.join('result', 'results.csv')
-    global_acc = f'{100 * correct / total:.2f}'
+    main_task_acc = f'{100 * correct / total:.2f}'
     
-    # 检查是否已存在相同的记录
-    should_write = True
-    if os.path.isfile(results_file):
+    should_write_header = not os.path.isfile(results_file)
+
+    # 检查重复
+    if not should_write_header:
         try:
             existing_df = pd.read_csv(results_file)
-            # 检查是否已有相同的算法、数据集和全局准确率的记录
-            duplicate = existing_df[
-                (existing_df['algorithm'] == 'Vanilla_VFL') &
-                (existing_df['dataset'] == args.dataset) &
-                (existing_df['global_accuracy'] == global_acc) &
-                (existing_df['local_accuracy'] == 'N/A')
-            ]
-            if not duplicate.empty:
-                print(f"结果已存在于CSV文件中，跳过重复记录")
-                should_write = False
+            record_exists = ((existing_df['algorithm'] == 'Vanilla_VFL') &
+                           (existing_df['dataset'] == args.dataset) &
+                           (existing_df['main_task_accuracy'] == main_task_acc)).any()
+            if record_exists:
+                print("结果已存在于CSV文件中，跳过重复记录。")
+                return
         except (pd.errors.EmptyDataError, FileNotFoundError):
-            should_write = True
-    
-    if should_write:
-        file_exists = os.path.isfile(results_file)
-        with open(results_file, 'a', newline='', encoding='utf-8') as csvfile:
-            fieldnames = ['algorithm', 'dataset', 'global_accuracy', 'local_accuracy']
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            if not file_exists:
-                writer.writeheader()
-            writer.writerow({
-                'algorithm': 'Vanilla_VFL',
-                'dataset': args.dataset,
-                'global_accuracy': global_acc,
-                'local_accuracy': 'N/A'
-            })
-            print(f"结果已保存到 {results_file}")
+            pass
+
+    with open(results_file, 'a', newline='', encoding='utf-8') as csvfile:
+        fieldnames = ['algorithm', 'dataset', 'main_task_accuracy', 'attack_accuracy']
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        if should_write_header:
+            writer.writeheader()
+        writer.writerow({
+            'algorithm': 'Vanilla_VFL',
+            'dataset': args.dataset,
+            'main_task_accuracy': main_task_acc,
+            'attack_accuracy': 'N/A'
+        })
+    print(f"结果已保存到 {results_file}")
 
 # --- 主程序执行 ---
 if __name__ == '__main__':

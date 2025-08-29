@@ -1,123 +1,121 @@
-# Implementation Guide for Boundary-Wandering Learning (BWL)
+# “边界漫游学习 (BWL)” 实现指南 (method.md)
 
-This document provides a comprehensive guide for implementing the Boundary-Wandering Learning (BWL) framework, a novel defense against Label Inference Attacks in Vertical Federated Learning (VFL).
+本文档为“边界漫游学习 (Boundary-Wandering Learning, BWL)”框架提供了一份全面的实现指南。BWL是一种针对垂直联邦学习 (VFL) 中标签推断攻击的新型防御机制。
 
-## 1. Overview
+## 1. 核心思想概述
 
-BWL introduces a new defense paradigm that shifts from "controlling information content" to "reshaping geometric structure". Instead of merely hiding or compressing information, BWL actively dismantles the geometric patterns in the embedding space that attackers exploit.
+BWL框架的核心防御范式是从“控制信息含量”转变为“重塑几何结构”。它并非简单地隐藏或压缩信息，而是主动地、系统性地瓦解攻击者赖以推断的嵌入空间几何结构。
 
-It achieves this through two core, synergistic components:
-1.  **Boundary-Wandering Loss ($L_{bw}$):** An innovative loss function that enforces "intra-class repulsion," forcing embeddings of the same class to be far apart in angular distance. This breaks the link between embedding similarity and label identity.
-2.  **Shadow Model Proxy (SMP) Architecture:** A novel architecture that decouples the privacy-preserving operations from the primary task learning. It uses a public-facing "obfuscated space" for federal interaction and a local "fidelity space" for high-accuracy prediction, resolving the classic privacy-utility trade-off.
+该框架通过两个相辅相成的核心组件实现这一目标：
+1.  **边界漫游损失 ($L_{bw}$):** 一种创新的损失函数，其原则是“同类相斥”。它强制同一类别的样本嵌入在角度上彼此远离，从而切断嵌入相似度与标签一致性之间的强关联。
+2.  **影子顶层模型 (Shadow Top Model) 架构:** 一种新颖的**双轨训练架构**，在主动方（防御者）处部署。该架构通过创建两个并行的顶层模型，实现了“联邦混淆空间”与“本地保真空间”的彻底解耦，从而解决了传统的隐私-效用冲突问题。
 
-## 2. System Setup & Prerequisites
+## 2. 系统设置与前提条件
 
--   **VFL Setting:** A standard two-party VFL setup.
-    -   **Party A (Attacker):** The passive party holding features $X_A$. This party is "honest-but-curious."
-    -   **Party B (Defender):** The active party holding features $X_B$ and the private labels $Y$.
-    -   **Server:** A central coordinator that hosts the top model, computes the global loss, and distributes gradients. (Often, the active party also acts as the server).
--   **Model Structure:**
-    -   Party A has a bottom model $M_A$.
-    -   Party B (Defender) implements the special SMP architecture (see Section 3.1).
-    -   The server has a top model $M_{top}$.
+-   **VFL场景:** 一个标准的双方垂直联邦学习设置。
+    -   **参与方A (攻击者):** 持有部分特征 $X_A$ 的被动方，其行为模式为“诚实但好奇”。
+    -   **参与方B (防御者):** 持有另一部分特征 $X_B$ 和全部私有标签 $Y$ 的主动方。**防御方同时扮演服务器角色**，负责所有顶层模型的计算和梯度分发。
+-   **模型结构:**
+    -   **参与方A:** 拥有一个底层模型 $M_A$。
+    -   **参与方B (防御者):** 部署特殊的双轨架构，包含：
+        -   两个底层模型：$M_{public}$ 和 $M_{private}$。
+        -   两个顶层模型：$M_{shadow\_top}$ (影子模型) 和 $M_{main\_top}$ (主模型/保真模型)。
 
-## 3. Core Component Implementation
+## 3. 核心组件实现
 
-### 3.1. Shadow Model Proxy (SMP) Architecture on Defender Side
+### 3.1. 防御方的双轨架构
 
-The defender (Party B) needs to set up a specific local architecture before training begins.
+在训练开始前，防御方 (参与方B) 需要在本地构建一个包含两个并行计算轨道的复杂架构。
 
-#### Step 1: Feature Partitioning
+#### 步骤 1: 特征划分
 
-The defender must partition their local features $X_B$ into two disjoint sets:
--   **Public Features ($x_{public}$):** A subset of features with a weaker correlation to the labels. These will be used for federal interaction.
--   **Private Features ($x_{private}$):** A subset of features with a strong correlation to the labels. These will be kept strictly local and never shared.
+防御者必须首先在本地将其特征 $X_B$ 划分为两个互不相交的集合：
+-   **公开特征 ($x_{public}$):** 与标签相关性较弱的一部分特征。
+-   **私有特征 ($x_{private}$):** 与标签高度相关的一部分特征。
 
-**Implementation Notes:**
--   This partitioning is a pre-processing step performed locally by the defender.
--   Standard feature selection techniques can be used for this purpose, such as calculating Mutual Information scores between each feature and the labels, or using feature importance derived from a pre-trained local model (e.g., Gradient Boosting).
--   The ratio of private to public features is a key hyperparameter. A recommended starting point is to designate 10-30% of the most informative features as private.
+**实现要点:**
+-   该划分是一个在VFL训练开始前完成的本地预处理步骤。
+-   可以使用标准的特征选择技术来完成，例如计算**互信息**或使用**特征重要性**排序。
+-   私有特征与公开特征的比例是一个重要的超参数，推荐从10%-30%的最具信息量的特征作为私有特征开始尝试。
 
-#### Step 2: Model Instantiation
+#### 步骤 2: 模型实例化
 
-The defender needs to instantiate three distinct local models:
-1.  **Shadow Model ($M_{shadow}$):** A bottom model that takes $x_{public}$ as input and produces the public embedding $E_{shadow}$. This is the only model whose output is sent to the server.
-2.  **Private Model ($M_{private}$):** A bottom model that takes $x_{private}$ as input and produces the private embedding $E_{private}$. This model and its output are strictly local.
-3.  **Local Head ($M_{local\_head}$):** A local classification head. It is used exclusively within the defender's local training loop to update the Private Model.
+防御者需要在本地实例化四组模型：
+1.  **公开底层模型 ($M_{public}$):** 输入为**公开特征** $x_{public}$，输出为公开嵌入 $E_{public}$。该模型的更新受联邦混淆轨道影响。
+2.  **私有底层模型 ($M_{private}$):** 输入为**私有特征** $x_{private}$，输出为私有嵌入 $E_{private}$。该模型的更新仅受本地保真轨道影响。
+3.  **影子顶层模型 ($M_{shadow\_top}$):** 这是**对外交互的模型**。它接收 $E_A$ 和 $E_{public}$，并基于包含 $L_{bw}$ 的损失进行计算，负责生成对外分发的梯度。
+4.  **主顶层模型 ($M_{main\_top}$):** 这是**纯本地的模型**。它接收 $E_A$, $E_{public}$ 和 $E_{private}$，并基于标准的交叉熵损失进行计算，其梯度仅用于更新私有底层模型。
 
-### 3.2. Boundary-Wandering Loss ($L_{bw}$)
+### 3.2. 边界漫游损失 ($L_{bw}$)
 
-This loss is calculated by the server (or the active party acting as the server) using the public embeddings received from the defender ($E_{shadow}$).
+该损失函数在**联邦混淆轨道**中，由防御者的**影子顶层模型**计算。计算对象是**从防御者自己公开底层模型产生的嵌入 $E_{public}$**。
 
-**Objective:** To maximize the angular distance between embeddings of the same class. In a minimization-based optimization framework, this is achieved by minimizing the cosine similarity between same-class embedding pairs.
+**目标:** 最大化同一批次内、同类别样本嵌入之间的角度距离。在基于最小化的优化框架中，这等价于最小化它们之间的余弦相似度。
 
-**Formula:**
-$$L_{bw} = \frac{1}{N_{pairs}} \sum_{\text{class } k} \sum_{i, j \in \mathcal{C}_k, i \neq j} \left( \frac{z_i}{\|z_i\|} \cdot \frac{z_j}{\|z_j\|} \right)$$
-where $z_i, z_j$ are shadow embeddings ($E_{shadow}$) from the same class $\mathcal{C}_k$ within a training batch.
+**数学公式:**
+$$L_{bw} = \frac{1}{N_{pairs}} \sum_{\text{类别 } k} \sum_{i, j \in \mathcal{C}_k, i \neq j} \left( \frac{z_i}{\|z_i\|} \cdot \frac{z_j}{\|z_j\|} \right)$$
+其中，$z_i$ 和 $z_j$ 是来自同一批次内、同一类别 $\mathcal{C}_k$ 的两个不同的公开嵌入向量 $E_{public}$。
 
-**Implementation Notes:**
--   For each batch, first normalize all shadow embeddings to the unit hypersphere.
--   Group the normalized embeddings by their corresponding labels.
--   For each group (class) containing more than one embedding, calculate the sum of cosine similarities (dot products of normalized vectors) for all unique pairs.
--   Sum these values across all classes and normalize by the total number of pairs computed.
--   It is important to use a sufficiently large batch size to ensure that batches frequently contain multiple samples from the same class, making the loss calculation effective.
+**实现要点:**
+-   在计算前，需要对该批次的所有 $E_{public}$ 向量进行L2归一化。
+-   根据标签将归一化后的嵌入向量分组，对每个包含多个样本的组计算所有唯一对的余弦相似度之和。
+-   为保证该损失的有效性，建议使用较大的批处理大小 (Batch Size)。
 
-## 4. The Complete Training Workflow (Single Batch)
+## 4. 完整训练流程 (单批次)
 
-The training process for a single batch is divided into three distinct phases.
+对于单个训练批次，防御者 (参与方B) 需要同时驱动两个并行的计算轨道。
 
-#### **Phase 1: Forward Pass**
+#### **阶段一：前向传播与嵌入交换**
 
-1.  **Party A (Attacker):**
-    -   Computes its embedding: $E_A = M_A(x_A)$.
-    -   Sends $E_A$ to the server.
-2.  **Party B (Defender):**
-    -   Splits its batch features: $x_B \rightarrow (x_{public}, x_{private})$.
-    -   Computes public embedding: $E_{shadow} = M_{shadow}(x_{public})$.
-    -   Computes private embedding: $E_{private} = M_{private}(x_{private})$.
-    -   Sends **only $E_{shadow}$** to the server.
-3.  **Server (Top Model):**
-    -   Receives $E_A$ and $E_{shadow}$.
-    -   Fuses them into a single vector: $E_{fused\_top} = \text{Concat}(E_A, E_{shadow})$.
-    -   Calculates the final prediction: $p = \text{Softmax}(M_{top}(E_{fused\_top}))$.
+1.  **参与方A:** 计算其本地嵌入: $E_A = M_A(x_A)$，并将其发送给防御方B。
+2.  **参与方B (防御者):**
+    -   划分其批次特征: $x_B \rightarrow (x_{public}, x_{private})$。
+    -   计算公开嵌入: $E_{public} = M_{public}(x_{public})$。
+    -   计算私有嵌入: $E_{private} = M_{private}(x_{private})$。
 
-#### **Phase 2: Loss Calculation on Server**
+#### **阶段二：双轨并行计算与反向传播**
 
-1.  **Prediction Loss:** The server calculates the standard cross-entropy loss based on the model's prediction: $L_{pred} = \text{CrossEntropy}(p, y)$.
-2.  **Wandering Loss:** The server calculates the Boundary-Wandering loss **exclusively on the defender's public embeddings**, $E_{shadow}$, as described in Section 3.2.
-3.  **Total Federal Loss:** The server combines these two losses using a hyperparameter $\alpha$: $L_{total} = L_{pred} + \alpha \cdot L_{bw}$.
+防御方B在本地并行执行以下两个轨道：
 
-#### **Phase 3: Backward Pass & Decoupled Updates**
+---
 
-This phase ensures that the disruptive privacy loss only affects the public-facing model.
+**轨道一：联邦混淆轨道 (Shadow Track)**
 
-1.  **Server:**
-    -   Computes the gradients of $L_{total}$ with respect to the top model's inputs: $\nabla E_A$ and $\nabla E_{shadow}$.
-    -   Sends $\nabla E_A$ back to Party A and $\nabla E_{shadow}$ back to Party B.
-2.  **Party A (Attacker):**
-    -   Receives $\nabla E_A$.
-    -   Performs backpropagation to update its bottom model $M_A$.
-3.  **Party B (Defender) - The Decoupled Update:** The defender performs two independent updates in parallel.
-    -   **Track 1 (Update Shadow Model):**
-        -   Receives $\nabla E_{shadow}$ from the server.
-        -   Uses this gradient to perform backpropagation and update the weights of the **Shadow Model $M_{shadow}$ only**.
-    -   **Track 2 (Update Private Model):**
-        -   **Isolate the gradient flow:** The defender must detach $E_{shadow}$ from the federal computation graph. This critical step prevents gradients from this local loop from flowing back into the shadow model.
-        -   Fuse the detached public embedding with the private one: $E_{fused\_local} = \text{Concat}(E_{shadow}.\text{detach}(), E_{private})$.
-        -   Pass the fused vector through the local head to get a local prediction: $p_{local} = M_{local\_head}(E_{fused\_local})$.
-        -   Calculate a local-only cross-entropy loss: $L_{local} = \text{CrossEntropy}(p_{local}, y)$.
-        -   Perform backpropagation from $L_{local}$ to update the weights of the **Private Model $M_{private}$ and the Local Head $M_{local\_head}$ only**.
+*   **目标:** 构建一个对攻击者不友好的混淆空间，并更新所有参与方的公开部分模型 ($M_A$ 和 $M_{public}$)。
+*   **流程:**
+    1.  **输入:** 参与方A的嵌入 $E_A$ 和防御方自身的公开嵌入 $E_{public}$。
+    2.  **融合:** $E_{fused\_shadow} = \text{Concat}(E_A, E_{public})$。
+    3.  **前向传播:** 通过**影子顶层模型** $M_{shadow\_top}$ 计算预测 $p_{shadow}$。
+    4.  **损失计算:** 计算复合损失 $L_{total} = \text{CrossEntropy}(p_{shadow}, y) + \alpha \cdot L_{bw}(E_{public}, y)$。
+    5.  **梯度计算:** 基于 $L_{total}$ 计算关于输入的梯度 $\nabla E_A$ 和 $\nabla E_{public}$。
+    6.  **梯度分发与更新:**
+        -   将 $\nabla E_A$ 发送回参与方A，A据此更新其底层模型 $M_A$。
+        -   在本地使用 $\nabla E_{public}$ 更新自身的**公开底层模型 $M_{public}$**。
 
-By following this procedure, the defender ensures that the privacy-enhancing but disruptive $L_{bw}$ only influences the public-facing $M_{shadow}$, while the performance-critical $M_{private}$ is trained cleanly using a standard objective.
+---
 
-## 5. Hyperparameters and Configuration
+**轨道二：本地保真轨道 (Main Track)**
 
-Key parameters to configure and tune during experimentation:
+*   **目标:** 在无干扰的理想环境下训练私有模型，以保证最终的预测性能。
+*   **流程:**
+    1.  **输入:** 参与方A的嵌入 $E_A$、防御方自身的公开嵌入 $E_{public}$ 和私有嵌入 $E_{private}$。
+    2.  **融合:** $E_{fused\_main} = \text{Concat}(E_A, E_{public}, E_{private})$。
+    3.  **前向传播:** 通过**主顶层模型** $M_{main\_top}$ 计算预测 $p_{main}$。
+    4.  **损失计算:** 仅计算标准的交叉熵损失 $L_{local} = \text{CrossEntropy}(p_{main}, y)$。
+    5.  **梯度计算与更新:** 基于 $L_{local}$ 进行反向传播，**梯度仅用于更新私有底层模型 $M_{private}$**。
 
--   `alpha` ($\alpha$): This is the most crucial hyperparameter. It controls the strength of the privacy defense.
-    -   `alpha = 0` corresponds to no defense.
-    -   Larger values of `alpha` increase the geometric obfuscation but may impact model utility if not properly balanced.
-    -   It should be tuned by evaluating the trade-off between attack success rate and primary task accuracy on a validation set.
--   **Feature Split Ratio:** The percentage of features allocated to $x_{private}$ vs. $x_{public}$. The optimal ratio may vary across different datasets.
--   **Batch Size:** A larger batch size is recommended to improve the stability and effectiveness of the Boundary-Wandering Loss.
--   **Learning Rates:** Separate learning rates can be used for the shadow and private models if necessary.
+---
+
+## 5. 推理阶段
+
+在模型训练完成后进行推理时，防御方**仅使用保真轨道**进行预测。
+1.  A发送其推理数据的嵌入 $E_A$。
+2.  B计算其推理数据的 $E_{public}$ 和 $E_{private}$。
+3.  B将三者融合后，输入**主顶层模型 $M_{main\_top}$** 得到最终的高精度预测结果。
+
+## 6. 超参数与配置
+
+-   `alpha` ($\alpha$): 最核心的超参数，用于平衡主任务性能与隐私保护强度。
+-   **特征划分比例:** 分配给私有特征与公开特征的比例。
+-   **模型架构:** $M_{shadow\_top}$ 和 $M_{main\_top}$ 的架构可以相同也可以不同。通常设为相同以简化实现。
+-   **批处理大小 (Batch Size):** 建议使用较大的批处理大小。

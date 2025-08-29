@@ -10,9 +10,10 @@
     },
     "bwl": {
       "bottom_model_party_a": "FCNN_Bottom",
-      "bottom_model_shadow": "FCNN_Shadow",
+      "bottom_model_public": "FCNN_Shadow",
       "bottom_model_private": "FCNN_Private",
-      "top_model": "FCNN_Top_3"
+      "shadow_top_model": "FCNN_Top_3",
+      "main_top_model": "FCNN_Main_Top_3"
     },
     "vanilla": {
       "bottom_model_party_a": "FCNN_Bottom",
@@ -28,9 +29,10 @@
     },
     "bwl": {
       "bottom_model_party_a": "ResNet18_Bottom",
-      "bottom_model_shadow": "ResNet18_Shadow",
+      "bottom_model_public": "ResNet18_Shadow",
       "bottom_model_private": "ResNet18_Private",
-      "top_model": "FCNN_Top_4"
+      "shadow_top_model": "FCNN_Top_4",
+      "main_top_model": "FCNN_Main_Top_4"
     },
     "vanilla": {
       "bottom_model_party_a": "ResNet18_Bottom",
@@ -46,9 +48,10 @@
     },
     "bwl": {
       "bottom_model_party_a": "ResNet18_Bottom",
-      "bottom_model_shadow": "ResNet18_Shadow",
+      "bottom_model_public": "ResNet18_Shadow",
       "bottom_model_private": "ResNet18_Private",
-      "top_model": "FCNN_Top_4"
+      "shadow_top_model": "FCNN_Top_4",
+      "main_top_model": "FCNN_Main_Top_4"
     },
     "vanilla": {
       "bottom_model_party_a": "ResNet18_Bottom",
