@@ -13,6 +13,7 @@ import pandas as pd
 import models.architectures as arch
 from losses.boundary_wandering_loss import boundary_wandering_loss
 from utils.data_loader import load_bcw, load_cifar10, load_cinic10, create_dataloader
+from utils.feature_partition import partition_features
 
 # --- 日志记录类 ---
 class Logger(object):
@@ -63,15 +64,31 @@ def train(args):
     (X_a_train, X_b_train, y_train), (X_a_test, X_b_test, y_test) = data_loader()
     train_loader = create_dataloader(X_a_train, X_b_train, y_train, batch_size=args.batch_size)
 
+    # 获取特征划分配置（优先使用命令行参数）
+    feature_partition_config = config.get('feature_partition', {})
+    partition_method = args.partition_method if args.partition_method else feature_partition_config.get('method', 'random')
+    private_ratio = args.private_ratio if args.private_ratio else feature_partition_config.get('private_ratio', 0.3)
+    random_state = feature_partition_config.get('random_state', 42)
+    shap_model_type = feature_partition_config.get('shap_model_type', 'xgboost')
+    
+    print(f"特征划分配置：方法={partition_method}, 私有比例={private_ratio}")
+
     if config['model_type'] == 'fcnn':
-        total_b_features = params['party_b_features']
-        ratio = params['public_feature_ratio']
-        num_public = int(total_b_features * ratio)
-        indices = np.arange(total_b_features)
-        np.random.shuffle(indices)
-        public_indices, private_indices = indices[:num_public], indices[num_public:]
+        # 使用新的特征划分接口
+        print(f"使用{partition_method}方法进行特征划分")
+        public_indices, private_indices = partition_features(
+            X_b_train, y_train,
+            method=partition_method,
+            private_ratio=private_ratio,
+            random_state=random_state,
+            model_type=shap_model_type
+        )
         num_public_features = len(public_indices)
         num_private_features = len(private_indices)
+        
+        print(f"特征划分结果：公开特征 {num_public_features} 个，私有特征 {num_private_features} 个")
+        print(f"公开特征索引：{public_indices[:10]}..." if len(public_indices) > 10 else f"公开特征索引：{public_indices}")
+        print(f"私有特征索引：{private_indices[:10]}..." if len(private_indices) > 10 else f"私有特征索引：{private_indices}")
     else:
         public_indices, private_indices = None, None
 
@@ -227,6 +244,8 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=64, help='批处理大小.')
     parser.add_argument('--alpha', type=float, default=1, help='边界徘徊损失的权重.')
     parser.add_argument('--print_freq', type=int, default=10, help='每多少个batch输出一次训练进度.')
+    parser.add_argument('--partition_method', type=str, default=None, choices=['shap', 'mutual_info', 'random'], help='特征划分方法，可选: shap, mutual_info, random. 如不指定则使用配置文件设置.')
+    parser.add_argument('--private_ratio', type=float, default=None, help='私有特征比例，如不指定则使用配置文件设置.')
     
     args = parser.parse_args()
 

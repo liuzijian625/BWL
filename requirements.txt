@@ -37,3 +37,5 @@ triton==3.4.0
 typing_extensions==4.15.0
 tzdata==2025.2
 ucimlrepo==0.0.7
+shap==0.45.1
+xgboost==2.1.3

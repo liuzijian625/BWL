@@ -8,6 +8,12 @@
       "num_classes": 2,
       "embedding_dim": 8
     },
+    "feature_partition": {
+      "method": "random",
+      "private_ratio": 0.3,
+      "random_state": 42,
+      "shap_model_type": "xgboost"
+    },
     "bwl": {
       "bottom_model_party_a": "FCNN_Bottom",
       "bottom_model_public": "FCNN_Shadow",
@@ -27,6 +33,12 @@
       "num_classes": 10,
       "embedding_dim": 128
     },
+    "feature_partition": {
+      "method": "random",
+      "private_ratio": 0.3,
+      "random_state": 42,
+      "shap_model_type": "xgboost"
+    },
     "bwl": {
       "bottom_model_party_a": "ResNet18_Bottom",
       "bottom_model_public": "ResNet18_Shadow",
@@ -45,6 +57,12 @@
     "params": {
       "num_classes": 10,
       "embedding_dim": 128
+    },
+    "feature_partition": {
+      "method": "random",
+      "private_ratio": 0.3,
+      "random_state": 42,
+      "shap_model_type": "xgboost"
     },
     "bwl": {
       "bottom_model_party_a": "ResNet18_Bottom",

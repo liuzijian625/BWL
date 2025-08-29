@@ -14,6 +14,7 @@ from sklearn.model_selection import train_test_split
 import models.architectures as arch
 from losses.boundary_wandering_loss import boundary_wandering_loss
 from utils.data_loader import load_bcw, load_cifar10, load_cinic10, create_dataloader
+from utils.feature_partition import partition_features
 
 # --- 日志记录类 ---
 class Logger(object):
@@ -92,15 +93,27 @@ def train_bwl_active(args, X_a_train, X_b_train, y_train):
 
     train_loader = create_dataloader(X_a_train, X_b_train, y_train, batch_size=args.batch_size)
 
+    # 获取特征划分配置
+    feature_partition_config = config.get('feature_partition', {})
+    partition_method = feature_partition_config.get('method', 'random')
+    private_ratio = feature_partition_config.get('private_ratio', 0.3)
+    random_state = feature_partition_config.get('random_state', 42)
+    shap_model_type = feature_partition_config.get('shap_model_type', 'xgboost')
+
     if config['model_type'] == 'fcnn':
-        total_b_features = params['party_b_features']
-        ratio = params['public_feature_ratio']
-        num_public = int(total_b_features * ratio)
-        indices = np.arange(total_b_features)
-        np.random.shuffle(indices)
-        public_indices, private_indices = indices[:num_public], indices[num_public:]
+        # 使用新的特征划分接口
+        print(f"使用{partition_method}方法进行特征划分")
+        public_indices, private_indices = partition_features(
+            X_b_train, y_train,
+            method=partition_method,
+            private_ratio=private_ratio,
+            random_state=random_state,
+            model_type=shap_model_type
+        )
         num_public_features = len(public_indices)
         num_private_features = len(private_indices)
+        
+        print(f"特征划分结果：公开特征 {num_public_features} 个，私有特征 {num_private_features} 个")
     else:
         public_indices, private_indices = None, None
 
