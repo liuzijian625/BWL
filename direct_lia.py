@@ -13,6 +13,8 @@ from torch.utils.data import TensorDataset, DataLoader
 
 import models.architectures as arch
 from utils.data_loader import load_bcw, load_cifar10, load_cinic10, create_dataloader
+from utils.attack_metrics import calculate_attack_metrics, print_attack_metrics
+from utils.results_saver import save_attack_results
 
 # --- 日志记录类 ---
 class Logger(object):
@@ -96,13 +98,32 @@ def train_and_attack(args, X_a_train, X_b_train, y_train):
 
     print("--- 训练和攻击结束 ---")
     
+    # 计算攻击指标
     valid_inferences = inferred_labels != -1
-    correct_total = (inferred_labels[valid_inferences] == y_train[valid_inferences]).sum().item()
-    total_inferred = valid_inferences.sum().item()
-    attack_accuracy = 100 * correct_total / total_inferred if total_inferred > 0 else 0
+    if valid_inferences.sum().item() > 0:
+        # 为计算攻击指标，构造虚拟的predictions
+        valid_targets = y_train[valid_inferences]
+        valid_predictions = inferred_labels[valid_inferences]
+        
+        # 获取类别数量
+        with open('config.json', 'r') as f:
+            config = json.load(f)[args.dataset]
+        num_classes = config['params']['num_classes']
+        
+        # 构造one-hot样式的predictions用于计算top-k指标
+        predictions_onehot = torch.zeros(len(valid_predictions), num_classes)
+        predictions_onehot[range(len(valid_predictions)), valid_predictions] = 1.0
+        
+        # 计算攻击指标
+        attack_metrics = calculate_attack_metrics(predictions_onehot, valid_targets, num_classes)
+        
+        print_attack_metrics(attack_metrics, 'Direct_LIA', args.dataset)
+    else:
+        # 如果没有有效推断，所有指标都为0
+        attack_metrics = {'acc': 0.0, 'top1_acc': 0.0, 'top5_acc': 0.0, 'f1_score': 0.0}
+        print("警告：没有有效的标签推断，所有攻击指标为0")
     
-    print(f'Direct LIA Attack Accuracy on {args.dataset} train set: {attack_accuracy:.2f} %')
-    return (party_a_model, party_b_model), attack_accuracy
+    return (party_a_model, party_b_model), attack_metrics
 
 # ============================== Main Task Performance Evaluation ==============================
 def test_direct_vfl(args, models, X_a_test, X_b_test, y_test):
@@ -130,33 +151,8 @@ def test_direct_vfl(args, models, X_a_test, X_b_test, y_test):
     return main_accuracy
 
 # ============================== Save Results ==============================
-def save_results(args, main_accuracy, attack_accuracy):
-    results_file = os.path.join('result', 'results.csv')
-    fieldnames = ['algorithm', 'dataset', 'main_accuracy', 'shadow_accuracy', 'attack_accuracy']
-    new_record = {
-        'algorithm': 'Direct_LIA',
-        'dataset': args.dataset,
-        'main_accuracy': f'{main_accuracy:.2f}',
-        'shadow_accuracy': 'N/A',
-        'attack_accuracy': f'{attack_accuracy:.2f}'
-    }
-
-    if not os.path.isfile(results_file):
-        with open(results_file, 'w', newline='') as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerow(new_record)
-    else:
-        df = pd.read_csv(results_file)
-        existing_index = df[(df['algorithm'] == 'Direct_LIA') & (df['dataset'] == args.dataset)].index
-        if not existing_index.empty:
-            df.loc[existing_index, list(new_record.keys())] = list(new_record.values())
-        else:
-            new_df = pd.DataFrame([new_record])
-            df = pd.concat([df, new_df], ignore_index=True)
-        df.to_csv(results_file, index=False)
-        
-    print(f"结果已更新/保存到 {results_file}")
+# 注意：现在只保存攻击指标，不再保存主任务准确率
+# 使用utils/results_saver.py中的save_attack_results函数
 
 # ============================== Main Execution ==============================
 if __name__ == '__main__':
@@ -178,10 +174,9 @@ if __name__ == '__main__':
     data_loader = DATA_LOADER_MAP[args.dataset]
     (X_a_train, X_b_train, y_train), (X_a_test, X_b_test, y_test) = data_loader()
 
-    vfl_models, attack_accuracy = train_and_attack(args, X_a_train, X_b_train, y_train)
+    vfl_models, attack_metrics = train_and_attack(args, X_a_train, X_b_train, y_train)
 
-    main_accuracy = test_direct_vfl(args, vfl_models, X_a_test, X_b_test, y_test)
-
-    save_results(args, main_accuracy, attack_accuracy)
+    # 保存攻击评估结果（不再测试主任务准确率）
+    save_attack_results('Direct_LIA', args.dataset, attack_metrics)
 
     print(f"========== 直接LIA攻击流程结束 ==========")

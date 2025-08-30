@@ -12,6 +12,8 @@ from sklearn.model_selection import train_test_split
 
 import models.architectures as arch
 from utils.data_loader import load_bcw, load_cifar10, load_cinic10, create_dataloader
+from utils.attack_metrics import evaluate_attack_model, print_attack_metrics
+from utils.results_saver import save_attack_results
 
 # --- 日志记录类 ---
 class Logger(object):
@@ -197,52 +199,25 @@ def perform_inference(args, attack_model, X_a_test, y_test):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"--- Phase 4: 在测试集上进行标签推断 ---")
     
-    attack_model = attack_model.to(device)
-    attack_model.eval()
-
+    # 准备测试数据加载器
     test_loader = create_dataloader(X_a_test, torch.zeros(len(X_a_test), 0), y_test, batch_size=args.batch_size, shuffle=False)
     
-    correct, total = 0, 0
-    with torch.no_grad():
-        for batch_X_a, _, batch_y in test_loader:
-            batch_X_a, batch_y = batch_X_a.to(device), batch_y.to(device)
-            prediction = attack_model(batch_X_a)
-            _, predicted = torch.max(prediction.data, 1)
-            total += batch_y.size(0)
-            correct += (predicted == batch_y).sum().item()
-
-    attack_accuracy = 100 * correct / total if total > 0 else 0
-    print(f'Active LIA Attack Accuracy on {args.dataset} test set: {attack_accuracy:.2f} %')
-    return attack_accuracy
+    # 获取类别数量
+    with open('config.json', 'r') as f:
+        config = json.load(f)[args.dataset]
+    num_classes = config['params']['num_classes']
+    
+    # 使用新的评估指标评估攻击模型
+    attack_metrics = evaluate_attack_model(attack_model, test_loader, device, num_classes)
+    
+    # 打印攻击评估指标
+    print_attack_metrics(attack_metrics, 'Active_LIA', args.dataset)
+    
+    return attack_metrics
 
 # ============================== Save Results ==============================
-def save_results(args, main_accuracy, attack_accuracy):
-    results_file = os.path.join('result', 'results.csv')
-    fieldnames = ['algorithm', 'dataset', 'main_accuracy', 'shadow_accuracy', 'attack_accuracy']
-    new_record = {
-        'algorithm': 'Active_LIA',
-        'dataset': args.dataset,
-        'main_accuracy': f'{main_accuracy:.2f}',
-        'shadow_accuracy': 'N/A',
-        'attack_accuracy': f'{attack_accuracy:.2f}'
-    }
-
-    if not os.path.isfile(results_file):
-        with open(results_file, 'w', newline='') as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerow(new_record)
-    else:
-        df = pd.read_csv(results_file)
-        existing_index = df[(df['algorithm'] == 'Active_LIA') & (df['dataset'] == args.dataset)].index
-        if not existing_index.empty:
-            df.loc[existing_index, list(new_record.keys())] = list(new_record.values())
-        else:
-            new_df = pd.DataFrame([new_record])
-            df = pd.concat([df, new_df], ignore_index=True)
-        df.to_csv(results_file, index=False)
-        
-    print(f"结果已更新/保存到 {results_file}")
+# 注意：现在只保存攻击指标，不再保存主任务准确率
+# 使用utils/results_saver.py中的save_attack_results函数
 
 # ============================== Main Execution ==============================
 if __name__ == '__main__':
@@ -277,12 +252,13 @@ if __name__ == '__main__':
 
     party_a_model_cpu, party_b_model, top_model = train_vfl(args, X_a_vfl, X_b_vfl, y_vfl)
 
-    main_accuracy = test_vfl(args, (party_a_model_cpu, party_b_model, top_model), X_a_test, X_b_test, y_test)
-
+    # 训练攻击模型
     attack_model = train_attack_model(args, party_a_model_cpu, X_a_aux, y_aux)
 
-    attack_accuracy = perform_inference(args, attack_model, X_a_test, y_test)
+    # 执行攻击评估（不再测试主任务准确率）
+    attack_metrics = perform_inference(args, attack_model, X_a_test, y_test)
 
-    save_results(args, main_accuracy, attack_accuracy)
+    # 保存攻击评估结果
+    save_attack_results('Active_LIA', args.dataset, attack_metrics)
 
     print(f"========== 主动LIA攻击流程结束 ==========")

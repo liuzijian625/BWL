@@ -15,6 +15,8 @@ import models.architectures as arch
 from losses.boundary_wandering_loss import boundary_wandering_loss
 from utils.data_loader import load_bcw, load_cifar10, load_cinic10, create_dataloader
 from utils.feature_partition import partition_features
+from utils.attack_metrics import evaluate_attack_model, print_attack_metrics
+from utils.results_saver import save_attack_results
 
 # --- 日志记录类 ---
 class Logger(object):
@@ -233,20 +235,22 @@ def train_attack_model(args, party_a_model, X_a_aux, y_aux):
 def perform_inference(args, attack_model, X_a_test, y_test):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"--- Phase 3: 在测试集上进行标签推断 ---")
-    attack_model = attack_model.to(device)
-    attack_model.eval()
+    
+    # 准备测试数据加载器
     test_loader = create_dataloader(X_a_test, torch.zeros(len(X_a_test), 0), y_test, batch_size=args.batch_size, shuffle=False)
-    correct, total = 0, 0
-    with torch.no_grad():
-        for batch_X_a, _, batch_y in test_loader:
-            batch_X_a, batch_y = batch_X_a.to(device), batch_y.to(device)
-            prediction = attack_model(batch_X_a)
-            _, predicted = torch.max(prediction.data, 1)
-            total += batch_y.size(0)
-            correct += (predicted == batch_y).sum().item()
-    attack_accuracy = 100 * correct / total if total > 0 else 0
-    print(f'被动攻击在BWL防御下的准确率: {attack_accuracy:.2f} %')
-    return attack_accuracy
+    
+    # 获取类别数量
+    with open('config.json', 'r') as f:
+        config = json.load(f)[args.dataset]
+    num_classes = config['params']['num_classes']
+    
+    # 使用新的评估指标评估攻击模型
+    attack_metrics = evaluate_attack_model(attack_model, test_loader, device, num_classes)
+    
+    # 打印攻击评估指标
+    print_attack_metrics(attack_metrics, 'Passive_LIA_on_BWL', args.dataset)
+    
+    return attack_metrics
 
 # ============================== Save Results ==============================
 def save_results(args, main_accuracy, shadow_accuracy, attack_accuracy):
@@ -310,15 +314,12 @@ if __name__ == '__main__':
     # 1. 训练BWL模型
     bwl_models, split_indices, config = train_bwl(args, X_a_vfl, X_b_vfl, y_vfl)
     
-    # 2. 评估BWL模型性能
-    main_acc, shadow_acc = test_bwl(args, bwl_models, (X_a_test, X_b_test, y_test), split_indices, config)
-
-    # 3. 提取攻击者模型并进行攻击
+    # 2. 提取攻击者模型并进行攻击（不再评估主任务性能）
     party_a_model_cpu = bwl_models[0].to('cpu')
     attack_model = train_attack_model(args, party_a_model_cpu, X_a_aux, y_aux)
-    attack_accuracy = perform_inference(args, attack_model, X_a_test, y_test)
+    attack_metrics = perform_inference(args, attack_model, X_a_test, y_test)
 
-    # 4. 保存所有结果
-    save_results(args, main_acc, shadow_acc, attack_accuracy)
+    # 3. 保存攻击评估结果
+    save_attack_results('Passive_LIA_on_BWL', args.dataset, attack_metrics)
 
     print(f"========== Passive LIA on BWL 流程结束 ==========")
